@@ -2,16 +2,16 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { View, Text, StyleSheet, FlatList, ActivityIndicator, TouchableOpacity, RefreshControl, SafeAreaView, StatusBar } from 'react-native';
 import Icon from 'react-native-vector-icons/Ionicons';
 import { getLogs, getLocations } from '../config/apiClient';
-import { getRiskFromLevel } from '../config/api';
+import { riskFromLevel } from '../config/nodes';
 
 const COLORS = {
-  background: '#F8FAFC', 
+  background: '#F8FAFC',
   cardBg: '#FFFFFF',
-  textMain: '#0F172A',   
-  textMuted: '#64748B',  
-  border: '#F1F5F9',     
-  primary: '#0EA5E9',    
-  danger: '#EF4444',     
+  textMain: '#0F172A',
+  textMuted: '#64748B',
+  border: '#F1F5F9',
+  primary: '#0EA5E9',
+  danger: '#EF4444',
 };
 
 const HistoryScreen = ({ route, navigation }) => {
@@ -24,36 +24,36 @@ const HistoryScreen = ({ route, navigation }) => {
   // Menerima parameter jika dinavigasikan dari detail Node di Peta
   const { nodeId, nodeName } = route?.params || {};
 
-  const fetchHistoryData = useCallback(async () => {
-    setLoading(true);
+  const fetchHistoryData = useCallback(async (isRefresh = false) => {
+    if (!isRefresh) setLoading(true);
     setError(null);
     try {
-      const [logsData, locationsData] = await Promise.all([
-        getLogs(),
-        getLocations(),
-      ]);
+      const [logs, locs] = await Promise.all([getLogs(), getLocations()]);
 
+      // Peta id -> objek lokasi (untuk nama & ambang risiko per-node)
       const locMap = {};
-      if (locationsData) {
-        locationsData.forEach((loc) => {
-          locMap[loc.id] = loc.name;
-        });
-      }
+      (locs || []).forEach(loc => { locMap[loc.id] = loc; });
       setLocations(locMap);
 
-      if (logsData && logsData.length > 0) {
-        // Jika ada nodeId, filter datanya. Jika tidak, tampilkan semua.
-        const filteredLogs = nodeId 
-          ? logsData.filter(log => String(log.location_id) === String(nodeId))
-          : logsData;
-
-        const sorted = [...filteredLogs].sort(
-          (a, b) => new Date(b.timestamp) - new Date(a.timestamp),
-        );
-        setHistoryData(sorted);
+      let result;
+      if (nodeId) {
+        // Filter per node: tampilkan semua log node tersebut
+        result = (logs || [])
+          .filter(log => String(log.location_id) === String(nodeId))
+          .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
       } else {
-        setHistoryData([]);
+        // Tanpa filter: tampilkan 1 data terbaru per node
+        const latestPerNode = {};
+        (logs || []).forEach(log => {
+          const existing = latestPerNode[log.location_id];
+          if (!existing || new Date(log.timestamp) > new Date(existing.timestamp)) {
+            latestPerNode[log.location_id] = log;
+          }
+        });
+        result = Object.values(latestPerNode)
+          .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
       }
+      setHistoryData(result);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -67,13 +67,14 @@ const HistoryScreen = ({ route, navigation }) => {
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
-    await fetchHistoryData();
+    await fetchHistoryData(true);
     setRefreshing(false);
   }, [fetchHistoryData]);
 
   const renderItem = ({ item }) => {
-    const status = getRiskFromLevel(item.water_level_cm);
-    const locationName = locations[item.location_id] || `Lokasi #${item.location_id}`;
+    const loc = locations[item.location_id];
+    const status = riskFromLevel(item.water_level_cm, loc);
+    const locationName = loc?.name || `Lokasi #${item.location_id}`;
     const timestamp = new Date(item.timestamp).toLocaleString('id-ID', {
       day: '2-digit', month: 'short', year: 'numeric',
       hour: '2-digit', minute: '2-digit',

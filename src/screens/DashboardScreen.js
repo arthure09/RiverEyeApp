@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { View, Text, StyleSheet, SafeAreaView, ScrollView, ActivityIndicator, TouchableOpacity, RefreshControl } from 'react-native';
 import MapView, { Marker, PROVIDER_GOOGLE } from 'react-native-maps';
+import { getLocations, getLogs } from '../config/apiClient';
+import { buildNodes } from '../config/nodes';
 
 // Palet warna premium (Ultra-Clean Slate & Sky UI)
 const COLORS = {
@@ -15,30 +17,8 @@ const COLORS = {
   danger: '#EF4444',   // Red
 };
 
-// --- MOCK DATA NODE (Sembari menunggu Backend Arthur) ---
-const MOCK_NODES = [
-  {
-    id: 'ND-001',
-    name: 'Pintu Air ITS',
-    coordinates: { latitude: -7.2823, longitude: 112.7949 },
-    hardware: { has_sensor: true, has_camera: true },
-    status: { level_cm: 210, risk: 'BAHAYA', color: COLORS.danger }
-  },
-  {
-    id: 'ND-002',
-    name: 'Sungai Keputih',
-    coordinates: { latitude: -7.2855, longitude: 112.7988 },
-    hardware: { has_sensor: true, has_camera: false },
-    status: { level_cm: 150, risk: 'WASPADA', color: COLORS.warning }
-  },
-  {
-    id: 'ND-003',
-    name: 'Saluran Mulyorejo',
-    coordinates: { latitude: -7.2711, longitude: 112.7889 },
-    hardware: { has_sensor: true, has_camera: true },
-    status: { level_cm: 80, risk: 'AMAN', color: COLORS.safe }
-  }
-];
+// Lokasi default peta jika belum ada node (Surabaya)
+const FALLBACK_REGION = { latitude: -7.2575, longitude: 112.7521 };
 
 const DashboardScreen = ({ navigation }) => {
   const [loading, setLoading] = useState(true);
@@ -47,11 +27,14 @@ const DashboardScreen = ({ navigation }) => {
 
   const fetchData = useCallback(async () => {
     setLoading(true);
-    // Simulasi delay jaringan
-    setTimeout(() => {
-      setNodes(MOCK_NODES);
+    try {
+      const [locations, logs] = await Promise.all([getLocations(), getLogs()]);
+      setNodes(buildNodes(locations || [], logs || []));
+    } catch {
+      setNodes([]);
+    } finally {
       setLoading(false);
-    }, 1000);
+    }
   }, []);
 
   useEffect(() => {
@@ -164,8 +147,8 @@ const DashboardScreen = ({ navigation }) => {
               provider={PROVIDER_GOOGLE}
               style={styles.map}
               initialRegion={{
-                latitude: MOCK_NODES[0].coordinates.latitude,
-                longitude: MOCK_NODES[0].coordinates.longitude,
+                latitude: nodes[0]?.coordinates.latitude ?? FALLBACK_REGION.latitude,
+                longitude: nodes[0]?.coordinates.longitude ?? FALLBACK_REGION.longitude,
                 latitudeDelta: 0.05,
                 longitudeDelta: 0.05,
               }}
