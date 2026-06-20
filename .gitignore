@@ -48,6 +48,15 @@ yarn-error.log
 # For more information about the recommended setup visit:
 # https://docs.fastlane.tools/best-practices/source-control/
 
+# Local config files
+src/config/nodes.js
+
+# Firebase / kredensial (jangan di-commit)
+android/app/google-services.json
+
+# Claude local config
+.claude/
+
 **/fastlane/report.xml
 **/fastlane/Preview.html
 **/fastlane/screenshots
