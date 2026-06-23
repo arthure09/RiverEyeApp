@@ -213,12 +213,6 @@ const DashboardScreen = ({ navigation }) => {
         <View style={styles.sectionHeader}>
           <View style={styles.sectionTitleRow}>
             <Text style={[styles.sectionTitle, dynamicStyles.textMain]}>Laporan Warga</Text>
-            {tweets.length > 0 && (
-              <View style={[styles.liveBadge, { backgroundColor: themeColors.danger + '20' }]}>
-                <View style={[styles.pulseDot, { backgroundColor: themeColors.danger }]} />
-                <Text style={[styles.liveBadgeText, dynamicStyles.dangerText]}>LIVE</Text>
-              </View>
-            )}
           </View>
           
           {/* Tombol Refresh Khusus Tweet */}
