@@ -8,6 +8,8 @@ import MapView, { Marker, Polyline, PROVIDER_GOOGLE } from 'react-native-maps';
 import Icon from 'react-native-vector-icons/Ionicons';
 import { getLocations, getLogs } from '../config/apiClient';
 import { buildNodes } from '../config/nodes';
+import { computeFloodedRoads } from '../config/roads';
+import { GOOGLE_MAPS_API_KEY } from '../config/secrets';
 
 // Mengambil Global State Theme
 import { ThemeContext } from '../context/ThemeContext';
@@ -41,7 +43,10 @@ const DARK_COLORS = {
 };
 
 const FALLBACK_LOCATION = { latitude: -7.2950, longitude: 112.7920 };
-const GOOGLE_DIRECTIONS_KEY = 'AIzaSyAU6Jm-3VtWsL7NtZ8WJoJCPT-xD4HGZvo';
+
+// Interval polling AJAX untuk refresh status titik pantau secara live (ms)
+const POLL_INTERVAL = 15000;
+const GOOGLE_DIRECTIONS_KEY = GOOGLE_MAPS_API_KEY;
 
 // Batasi rekomendasi pencarian hanya di sekitar Surabaya
 const SURABAYA_CENTER = { latitude: -7.2575, longitude: 112.7521 };
@@ -73,15 +78,30 @@ const haversine = (lat1, lon1, lat2, lon2) => {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 };
 
-const findBahayaNearRoute = (coords, nodes) => {
+// Cari titik pantau berstatus SIAGA atau WASPADA yang dilewati sebuah rute.
+const findHazardsNearRoute = (coords, nodes) => {
   const THRESHOLD = 500;
   return nodes.filter(n =>
-    n.status.risk === 'BAHAYA' &&
+    (n.status.risk === 'BAHAYA' || n.status.risk === 'WASPADA') &&
     coords.some((pt, i) =>
       i % 5 === 0 &&
       haversine(pt.latitude, pt.longitude, n.coordinates.latitude, n.coordinates.longitude) < THRESHOLD
     )
   );
+};
+
+// Tingkat bahaya rute: 'bahaya' (ada siaga), 'waspada', atau 'safe'.
+const routeLevelFrom = (hazards) => {
+  if (hazards.some(n => n.status.risk === 'BAHAYA')) return 'bahaya';
+  if (hazards.some(n => n.status.risk === 'WASPADA')) return 'waspada';
+  return 'safe';
+};
+
+// Bangun objek rute seragam dari koordinat + info jarak/durasi.
+const buildRoute = (coords, distance, duration, nodes) => {
+  const hazards = findHazardsNearRoute(coords, nodes);
+  const level = routeLevelFrom(hazards);
+  return { coords, distance, duration, hazards, level, isSafe: level === 'safe' };
 };
 
 const formatDistance = (meters) =>
@@ -189,8 +209,18 @@ const MapScreen = ({ navigation }) => {
   const [originSuggestions, setOriginSuggestions] = useState([]);
   const [isSearchingOrigin, setIsSearchingOrigin] = useState(false);
 
-  const dangerCount = nodes.filter(n => n.status.risk === 'BAHAYA').length;
+  // Ruas jalan banjir (>=2 titik siaga) + geometri jalan hasil snap Directions.
+  const [floodRoadPaths, setFloodRoadPaths] = useState([]);
+  const floodedRoads = useMemo(() => computeFloodedRoads(nodes), [nodes]);
+
+  const dangerCount = nodes.filter(n => n.status.risk === 'BAHAYA' || n.status.risk === 'WASPADA').length;
   const activeRoute = allRoutes[activeRouteIdx] ?? null;
+
+  // Warna & label menurut tingkat bahaya rute.
+  const levelColor = useCallback((lvl) =>
+    lvl === 'bahaya' ? themeColors.danger : lvl === 'waspada' ? themeColors.warning : themeColors.safe,
+  [themeColors]);
+  const levelLabel = (lvl) => (lvl === 'bahaya' ? 'Bahaya' : lvl === 'waspada' ? 'Waspada' : 'Aman');
 
   useEffect(() => {
     StatusBar.setBarStyle(isDarkMode ? 'light-content' : 'dark-content');
@@ -203,16 +233,52 @@ const MapScreen = ({ navigation }) => {
 
   useEffect(() => {
     let active = true;
-    (async () => {
+    // silent = true (polling) mempertahankan data lama jika request gagal
+    const loadNodes = async (silent = false) => {
       try {
         const [locations, logs] = await Promise.all([getLocations(), getLogs()]);
         if (active) setNodes(buildNodes(locations || [], logs || []));
       } catch {
-        if (active) setNodes([]);
+        if (active && !silent) setNodes([]);
       }
+    };
+    loadNodes();
+    // Polling AJAX: refresh status titik pantau secara live tiap POLL_INTERVAL
+    const timer = setInterval(() => loadNodes(true), POLL_INTERVAL);
+    return () => { active = false; clearInterval(timer); };
+  }, []);
+
+  // Snap tiap ruas jalan banjir ke geometri jalan asli (fallback: garis lurus antar titik).
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      if (!floodedRoads.length) { setFloodRoadPaths([]); return; }
+      const results = await Promise.all(floodedRoads.map(async (road) => {
+        const fallback = { key: road.key, name: road.name, coords: road.path, nodes: road.nodes };
+        try {
+          const pts = road.path;
+          const start = pts[0];
+          const end = pts[pts.length - 1];
+          const mid = pts.slice(1, -1);
+          const waypoints = mid.length ? `&waypoints=${mid.map(p => `${p.latitude},${p.longitude}`).join('|')}` : '';
+          const res = await fetch(
+            `https://maps.googleapis.com/maps/api/directions/json` +
+            `?origin=${start.latitude},${start.longitude}` +
+            `&destination=${end.latitude},${end.longitude}` +
+            waypoints +
+            `&key=${GOOGLE_DIRECTIONS_KEY}`,
+          );
+          const data = await res.json();
+          if (data.status === 'OK' && data.routes?.length) {
+            return { ...fallback, coords: decodePolyline(data.routes[0].overview_polyline.points) };
+          }
+        } catch { }
+        return fallback;
+      }));
+      if (active) setFloodRoadPaths(results);
     })();
     return () => { active = false; };
-  }, []);
+  }, [floodedRoads]);
 
   const handleUserLocationChange = useCallback((event) => {
     const { coordinate } = event.nativeEvent;
@@ -337,16 +403,10 @@ const MapScreen = ({ navigation }) => {
         );
         const gData = await gRes.json();
         if (gData.status === 'OK' && gData.routes?.length) {
-          parsed = gData.routes.map(r => {
+          parsed = gData.routes.slice(0, 3).map(r => {
             const coords = decodePolyline(r.overview_polyline.points);
             const leg = r.legs[0];
-            return {
-              coords,
-              distance: formatDistance(leg.distance.value),
-              duration: formatDuration(leg.duration.value),
-              isSafe: findBahayaNearRoute(coords, nodes).length === 0,
-              warnings: findBahayaNearRoute(coords, nodes),
-            };
+            return buildRoute(coords, formatDistance(leg.distance.value), formatDuration(leg.duration.value), nodes);
           });
         }
       } catch { }
@@ -360,15 +420,9 @@ const MapScreen = ({ navigation }) => {
         );
         const oData = await oRes.json();
         if (oData.code !== 'Ok' || !oData.routes?.length) throw new Error(oData.code);
-        parsed = oData.routes.map(r => {
+        parsed = oData.routes.slice(0, 3).map(r => {
           const coords = decodePolyline(r.geometry);
-          return {
-            coords,
-            distance: formatDistance(r.distance),
-            duration: formatDuration(r.duration),
-            isSafe: findBahayaNearRoute(coords, nodes).length === 0,
-            warnings: findBahayaNearRoute(coords, nodes),
-          };
+          return buildRoute(coords, formatDistance(r.distance), formatDuration(r.duration), nodes);
         });
       }
 
@@ -529,6 +583,25 @@ const MapScreen = ({ navigation }) => {
         onUserLocationChange={handleUserLocationChange}
         onPress={() => { if (!isRoutingMode) setSelectedNode(null); }}
       >
+        {/* Overlay merah untuk ruas jalan banjir (>=2 titik siaga) */}
+        {floodRoadPaths.map((road) => {
+          const mid = road.coords[Math.floor(road.coords.length / 2)];
+          return (
+            <React.Fragment key={`flood-${road.key}`}>
+              <Polyline coordinates={road.coords} strokeColor="rgba(239,68,68,0.45)" strokeWidth={14} lineCap="round" />
+              <Polyline coordinates={road.coords} strokeColor="#EF4444" strokeWidth={5} lineCap="round" />
+              {mid && (
+                <Marker coordinate={mid} anchor={{ x: 0.5, y: 0.5 }} tracksViewChanges={false}>
+                  <View style={styles.floodTag}>
+                    <Icon name="warning" size={11} color="#FFFFFF" />
+                    <Text style={styles.floodTagText}>JALAN BANJIR</Text>
+                  </View>
+                </Marker>
+              )}
+            </React.Fragment>
+          );
+        })}
+
         {nodes.map((node) => (
           <Marker
             key={node.id}
@@ -536,7 +609,8 @@ const MapScreen = ({ navigation }) => {
             onPress={(e) => { e.stopPropagation(); handleMarkerPress(node); }}
           >
             <View style={[styles.customMarker, { backgroundColor: node.status.color + '33', borderColor: node.status.color + '66' }]}>
-              <View style={[styles.markerInner, { backgroundColor: node.status.color }]} />
+              {/* Alat kecil (sensor biner) ditandai kotak, sensor air ditandai bulat */}
+              <View style={[styles.markerInner, node.isBinary && styles.markerInnerBinary, { backgroundColor: node.status.color }]} />
             </View>
           </Marker>
         ))}
@@ -553,7 +627,7 @@ const MapScreen = ({ navigation }) => {
           <Marker coordinate={destination.coordinates} anchor={{ x: 0.5, y: 1 }}>
             <View style={styles.destMarkerWrapper}>
               <View style={[styles.destMarker, { backgroundColor: themeColors.primary }]}>
-                <Text style={styles.destMarkerIcon}>📍</Text>
+                <Icon name="location" size={18} color="#FFFFFF" />
               </View>
             </View>
           </Marker>
@@ -563,7 +637,7 @@ const MapScreen = ({ navigation }) => {
           <Polyline
             key={`route-${idx}`}
             coordinates={route.coords}
-            strokeColor={route.isSafe ? routeColors[idx] + 'AA' : themeColors.warning + '88'}
+            strokeColor={route.isSafe ? routeColors[idx] + 'AA' : levelColor(route.level) + '88'}
             strokeWidth={3}
             lineDashPattern={route.isSafe ? undefined : [10, 6]}
           />
@@ -572,7 +646,7 @@ const MapScreen = ({ navigation }) => {
           <Polyline
             key="route-active"
             coordinates={activeRoute.coords}
-            strokeColor={activeRoute.isSafe ? routeColors[activeRouteIdx] : themeColors.warning}
+            strokeColor={activeRoute.isSafe ? routeColors[activeRouteIdx] : levelColor(activeRoute.level)}
             strokeWidth={5}
             lineDashPattern={activeRoute.isSafe ? undefined : [10, 6]}
           />
@@ -617,7 +691,8 @@ const MapScreen = ({ navigation }) => {
                     ? <ActivityIndicator size="small" color={themeColors.textMuted} style={{ marginLeft: 8 }} />
                     : (
                       <TouchableOpacity onPress={retriggerGPS} style={styles.gpsChip}>
-                        <Text style={styles.gpsChipText}>📡 GPS</Text>
+                        <Icon name="locate" size={11} color={themeColors.primary} />
+                        <Text style={styles.gpsChipText}>GPS</Text>
                       </TouchableOpacity>
                     )
                 }
@@ -635,9 +710,10 @@ const MapScreen = ({ navigation }) => {
                         onPress={() => selectOriginSuggestion(item)}
                         activeOpacity={0.7}
                       >
-                        <Text style={styles.suggestionMain} numberOfLines={1}>
-                          {item._lat !== undefined ? '📍' : '🔍'} {main}
-                        </Text>
+                        <View style={styles.suggestionMainRow}>
+                          <Icon name={item._lat !== undefined ? 'location-outline' : 'search-outline'} size={13} color={themeColors.textMuted} />
+                          <Text style={styles.suggestionMain} numberOfLines={1}>{main}</Text>
+                        </View>
                         <Text style={styles.suggestionSub} numberOfLines={1}>
                           {sub}{item._lat === undefined ? '  · Google Maps' : ''}
                         </Text>
@@ -649,7 +725,10 @@ const MapScreen = ({ navigation }) => {
 
               {gpsFailed && !isLoadingLocation && (
                 <View style={styles.gpsBanner}>
-                  <Text style={styles.gpsBannerText}>📍 Lokasi GPS tidak aktif atau ditolak.</Text>
+                  <View style={styles.gpsBannerTextRow}>
+                    <Icon name="warning-outline" size={14} color={themeColors.textMain} />
+                    <Text style={styles.gpsBannerText}>Lokasi GPS tidak aktif atau ditolak.</Text>
+                  </View>
                   <View style={styles.gpsBannerActions}>
                     <TouchableOpacity style={styles.gpsBannerBtn} onPress={enableLocation} activeOpacity={0.8}>
                       <Text style={styles.gpsBannerBtnText}>Izinkan Lokasi</Text>
@@ -664,7 +743,7 @@ const MapScreen = ({ navigation }) => {
               <View style={styles.routeConnector} />
 
               <View style={styles.routeInputRow}>
-                <Text style={styles.destDot}>📍</Text>
+                <Icon name="location" size={16} color={themeColors.danger} style={styles.destDot} />
                 <TextInput
                   style={styles.destTextInput}
                   placeholder="Ketik tujuan..."
@@ -691,9 +770,10 @@ const MapScreen = ({ navigation }) => {
                         onPress={() => selectSuggestion(item)}
                         activeOpacity={0.7}
                       >
-                        <Text style={styles.suggestionMain} numberOfLines={1}>
-                          {item._lat !== undefined ? '📍' : '🔍'} {main}
-                        </Text>
+                        <View style={styles.suggestionMainRow}>
+                          <Icon name={item._lat !== undefined ? 'location-outline' : 'search-outline'} size={13} color={themeColors.textMuted} />
+                          <Text style={styles.suggestionMain} numberOfLines={1}>{main}</Text>
+                        </View>
                         <Text style={styles.suggestionSub} numberOfLines={1}>
                           {sub}{item._lat === undefined ? '  · Google Maps' : ''}
                         </Text>
@@ -704,14 +784,18 @@ const MapScreen = ({ navigation }) => {
               )}
 
               {activeRoute && !isLoadingRoute && (
-                <View style={[styles.routeInfoRow, { borderTopColor: activeRoute.isSafe ? themeColors.border : themeColors.warning + '40' }]}>
-                  <Text style={[styles.routeInfoText, { color: activeRoute.isSafe ? themeColors.safe : themeColors.warning }]}>
-                    {activeRoute.isSafe ? '✅' : '⚠️'} {ROUTE_LABELS[activeRouteIdx]} · {activeRoute.distance} · {activeRoute.duration}
+                <View style={[styles.routeInfoRow, { borderTopColor: activeRoute.isSafe ? themeColors.border : levelColor(activeRoute.level) + '40' }]}>
+                  <Icon name={activeRoute.isSafe ? 'checkmark-circle' : 'warning'} size={15} color={levelColor(activeRoute.level)} />
+                  <Text style={[styles.routeInfoText, { color: levelColor(activeRoute.level) }]}>
+                    {ROUTE_LABELS[activeRouteIdx]} · {activeRoute.distance} · {activeRoute.duration}
                   </Text>
                 </View>
               )}
               {!activeRoute && !isLoadingRoute && !isLoadingLocation && suggestions.length === 0 && !destination && (
-                <Text style={styles.avoidText}>⚠️ Menghindari {dangerCount} titik banjir</Text>
+                <View style={styles.avoidRow}>
+                  <Icon name="warning" size={12} color={themeColors.warning} />
+                  <Text style={styles.avoidText}>Menghindari {dangerCount} titik rawan banjir</Text>
+                </View>
               )}
             </View>
           )}
@@ -725,33 +809,35 @@ const MapScreen = ({ navigation }) => {
             <View style={styles.warningCardHeader}>
               <View style={styles.warningTitleRow}>
                 <View style={styles.warningIconBg}>
-                  <Text style={styles.warningIconText}>⚠️</Text>
+                  <Icon name="warning" size={16} color={themeColors.warning} />
                 </View>
                 <View>
-                  <Text style={styles.warningTitle}>Peringatan Banjir</Text>
-                  <Text style={styles.warningSubtitle}>Rute utama melewati area berbahaya</Text>
+                  <Text style={styles.warningTitle}>Peringatan Rute</Text>
+                  <Text style={styles.warningSubtitle}>Rute utama melewati titik siaga / waspada</Text>
                 </View>
               </View>
               <TouchableOpacity onPress={() => setShowWarningCard(false)} style={styles.warningCloseBtn}>
-                <Text style={styles.warningCloseText}>✕</Text>
+                <Icon name="close" size={13} color={themeColors.textMuted} />
               </TouchableOpacity>
             </View>
 
             <View style={styles.warningDivider} />
-            {allRoutes[0].warnings.map(node => (
+            {allRoutes[0].hazards.map(node => (
               <View key={node.id} style={styles.warningNodeRow}>
-                <View style={styles.warningDot} />
+                <View style={[styles.warningDot, { backgroundColor: node.status.color }]} />
                 <Text style={styles.warningNodeName}>{node.name}</Text>
-                <Text style={styles.warningNodeLevel}>{node.status.level_cm} cm</Text>
+                <Text style={[styles.warningNodeLevel, { color: node.status.color }]}>
+                  {node.isBinary ? (node.status.flood ? 'Banjir' : 'Kering') : `${node.status.level_cm} cm`}
+                </Text>
               </View>
             ))}
 
             <View style={styles.warningDivider} />
-            <Text style={styles.altSectionTitle}>Pilih Rute</Text>
+            <Text style={styles.altSectionTitle}>3 Pilihan Rute</Text>
 
             {allRoutes.map((route, idx) => {
               const isActive = idx === activeRouteIdx;
-              const lineColor = route.isSafe ? routeColors[idx] : themeColors.warning;
+              const lineColor = route.isSafe ? routeColors[idx] : levelColor(route.level);
               return (
                 <TouchableOpacity
                   key={idx}
@@ -771,16 +857,17 @@ const MapScreen = ({ navigation }) => {
                           </View>
                         )}
                       </View>
-                      <View style={[styles.altSafeBadge, { backgroundColor: route.isSafe ? themeColors.safe + '15' : themeColors.warning + '15' }]}>
-                        <Text style={[styles.altSafeBadgeText, { color: route.isSafe ? themeColors.safe : themeColors.warning }]}>
-                          {route.isSafe ? '✅ Aman' : '⚠️ Bahaya'}
+                      <View style={[styles.altSafeBadge, { backgroundColor: levelColor(route.level) + '15' }]}>
+                        <Icon name={route.isSafe ? 'checkmark-circle' : 'warning'} size={11} color={levelColor(route.level)} />
+                        <Text style={[styles.altSafeBadgeText, { color: levelColor(route.level) }]}>
+                          {levelLabel(route.level)}
                         </Text>
                       </View>
                     </View>
                     <Text style={styles.altRouteDetail}>{route.distance} · {route.duration}</Text>
                     {!route.isSafe && (
                       <Text style={styles.altRouteDanger} numberOfLines={1}>
-                        Dekat: {route.warnings.map(n => n.name).join(', ')}
+                        Dekat: {route.hazards.map(n => n.name).join(', ')}
                       </Text>
                     )}
                   </View>
@@ -809,31 +896,61 @@ const MapScreen = ({ navigation }) => {
           </View>
           <View style={styles.sheetBody}>
             <View style={styles.dataBlock}>
-              <Text style={styles.dataLabel}>Ketinggian Air</Text>
-              <Text style={styles.dataValue}>
-                {(selectedNode.status.level_cm / 100).toFixed(2)}{' '}
-                <Text style={styles.dataUnit}>Meter</Text>
-              </Text>
+              {selectedNode.isBinary ? (
+                <>
+                  <Text style={styles.dataLabel}>Status Jalan</Text>
+                  <Text style={[styles.dataValue, { color: selectedNode.status.color }]}>
+                    {selectedNode.status.flood ? 'Banjir' : 'Kering'}
+                  </Text>
+                </>
+              ) : (
+                <>
+                  <Text style={styles.dataLabel}>Ketinggian Air</Text>
+                  <Text style={styles.dataValue}>
+                    {(selectedNode.status.level_cm / 100).toFixed(2)}{' '}
+                    <Text style={styles.dataUnit}>Meter</Text>
+                  </Text>
+                </>
+              )}
             </View>
             <View style={styles.dataBlock}>
               <Text style={styles.dataLabel}>Perangkat Keras</Text>
               <View style={styles.hardwareRow}>
-                {selectedNode.hardware.has_sensor && <Text style={styles.hwIcon}>💧 Sensor Aktif</Text>}
-                {selectedNode.hardware.has_camera && <Text style={styles.hwIcon}>📹 CCTV Aktif</Text>}
+                {selectedNode.hardware.has_sensor && (
+                  <View style={styles.hwChip}>
+                    <Icon name={selectedNode.isBinary ? 'hardware-chip' : 'water'} size={12} color={themeColors.textMuted} />
+                    <Text style={styles.hwChipText}>{selectedNode.isBinary ? 'Alat Kecil' : 'Sensor Aktif'}</Text>
+                  </View>
+                )}
+                {selectedNode.hardware.has_camera && (
+                  <View style={styles.hwChip}>
+                    <Icon name="videocam" size={12} color={themeColors.textMuted} />
+                    <Text style={styles.hwChipText}>CCTV Aktif</Text>
+                  </View>
+                )}
               </View>
             </View>
           </View>
           <View style={styles.actionRow}>
             <TouchableOpacity style={styles.secondaryButton} activeOpacity={0.8} onPress={() => handleOpenHistory(selectedNode)}>
-              <Text style={styles.secondaryButtonText}>📊 Riwayat</Text>
+              <View style={styles.btnContent}>
+                <Icon name="stats-chart" size={15} color={themeColors.primary} />
+                <Text style={styles.secondaryButtonText}>Riwayat</Text>
+              </View>
             </TouchableOpacity>
             {selectedNode.hardware.has_camera ? (
               <TouchableOpacity style={styles.primaryButton} activeOpacity={0.8} onPress={() => handleOpenCCTV(selectedNode)}>
-                <Text style={styles.primaryButtonText}>🎥 Live CCTV</Text>
+                <View style={styles.btnContent}>
+                  <Icon name="videocam" size={15} color="#FFFFFF" />
+                  <Text style={styles.primaryButtonText}>Live CCTV</Text>
+                </View>
               </TouchableOpacity>
             ) : (
               <View style={styles.disabledButton}>
-                <Text style={styles.disabledButtonText}>📵 CCTV Off</Text>
+                <View style={styles.btnContent}>
+                  <Icon name="videocam-off" size={15} color={themeColors.textMuted} />
+                  <Text style={styles.disabledButtonText}>CCTV Off</Text>
+                </View>
               </View>
             )}
           </View>
@@ -853,6 +970,14 @@ const getStyles = (COLORS, isDarkMode) => StyleSheet.create({
     justifyContent: 'center', alignItems: 'center', borderWidth: 1.5,
   },
   markerInner: { width: 16, height: 16, borderRadius: 8, borderWidth: 2.5, borderColor: '#FFFFFF' },
+  markerInnerBinary: { borderRadius: 3 },
+
+  floodTag: {
+    flexDirection: 'row', alignItems: 'center', gap: 4,
+    backgroundColor: '#EF4444', paddingHorizontal: 8, paddingVertical: 4,
+    borderRadius: 8, borderWidth: 1.5, borderColor: '#FFFFFF',
+  },
+  floodTagText: { color: '#FFFFFF', fontSize: 9, fontWeight: '800', letterSpacing: 0.5 },
 
   originMarker: {
     width: 24, height: 24, borderRadius: 12,
@@ -864,7 +989,6 @@ const getStyles = (COLORS, isDarkMode) => StyleSheet.create({
 
   destMarkerWrapper: { alignItems: 'center' },
   destMarker: { width: 36, height: 36, borderRadius: 18, justifyContent: 'center', alignItems: 'center' },
-  destMarkerIcon: { fontSize: 18 },
 
   headerWrapper: { position: 'absolute', top: 0, left: 0, right: 0, zIndex: 10 },
   routingCard: {
@@ -885,10 +1009,11 @@ const getStyles = (COLORS, isDarkMode) => StyleSheet.create({
     width: 12, height: 12, borderRadius: 6,
     backgroundColor: COLORS.primary, marginRight: 12, borderWidth: 2, borderColor: COLORS.primary + '40',
   },
-  destDot: { fontSize: 16, marginRight: 10 },
+  destDot: { marginRight: 10 },
   routeConnector: { width: 2, height: 16, backgroundColor: COLORS.border, marginLeft: 5, marginVertical: 2 },
   routeInputText: { flex: 1, fontSize: 14, fontWeight: '600', color: COLORS.textMain },
   gpsChip: {
+    flexDirection: 'row', alignItems: 'center', gap: 4,
     backgroundColor: COLORS.primary + '15',
     paddingHorizontal: 8, paddingVertical: 3,
     borderRadius: 8, marginLeft: 6,
@@ -900,7 +1025,8 @@ const getStyles = (COLORS, isDarkMode) => StyleSheet.create({
     backgroundColor: COLORS.warning + '12',
     borderWidth: 1, borderColor: COLORS.warning + '33',
   },
-  gpsBannerText: { fontSize: 12, fontWeight: '700', color: COLORS.textMain, marginBottom: 8 },
+  gpsBannerTextRow: { flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 8 },
+  gpsBannerText: { fontSize: 12, fontWeight: '700', color: COLORS.textMain },
   gpsBannerActions: { flexDirection: 'row', gap: 8 },
   gpsBannerBtn: {
     flex: 1, paddingVertical: 8, borderRadius: 10,
@@ -916,11 +1042,13 @@ const getStyles = (COLORS, isDarkMode) => StyleSheet.create({
     paddingVertical: 10, paddingHorizontal: 4,
     borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: COLORS.border,
   },
-  suggestionMain: { fontSize: 13, fontWeight: '700', color: COLORS.textMain },
+  suggestionMainRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  suggestionMain: { flex: 1, fontSize: 13, fontWeight: '700', color: COLORS.textMain },
   suggestionSub: { fontSize: 11, color: COLORS.textMuted, marginTop: 1 },
 
-  avoidText: { marginTop: 10, fontSize: 11, fontWeight: '700', color: COLORS.warning },
-  routeInfoRow: { marginTop: 10, paddingTop: 10, borderTopWidth: 1 },
+  avoidRow: { flexDirection: 'row', alignItems: 'center', gap: 5, marginTop: 10 },
+  avoidText: { fontSize: 11, fontWeight: '700', color: COLORS.warning },
+  routeInfoRow: { flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 10, paddingTop: 10, borderTopWidth: 1 },
   routeInfoText: { fontSize: 13, fontWeight: '700' },
 
   // Warning Card
@@ -939,14 +1067,12 @@ const getStyles = (COLORS, isDarkMode) => StyleSheet.create({
     backgroundColor: COLORS.warning + '15',
     justifyContent: 'center', alignItems: 'center', marginRight: 10,
   },
-  warningIconText: { fontSize: 15 },
   warningTitle: { fontSize: 13, fontWeight: '800', color: COLORS.textMain },
   warningSubtitle: { fontSize: 10, color: COLORS.textMuted, fontWeight: '500' },
   warningCloseBtn: {
     width: 22, height: 22, borderRadius: 11,
     backgroundColor: COLORS.border, justifyContent: 'center', alignItems: 'center', marginLeft: 8,
   },
-  warningCloseText: { fontSize: 10, color: COLORS.textMuted, fontWeight: '700' },
   warningDivider: { height: 1, backgroundColor: COLORS.border, marginVertical: 8 },
   warningNodeRow: {
     flexDirection: 'row', alignItems: 'center',
@@ -973,7 +1099,7 @@ const getStyles = (COLORS, isDarkMode) => StyleSheet.create({
   altRouteLabel: { fontSize: 12, fontWeight: '800', color: COLORS.textMain },
   recommendedBadge: { backgroundColor: COLORS.safe + '20', paddingHorizontal: 5, paddingVertical: 1, borderRadius: 5 },
   recommendedText: { fontSize: 9, fontWeight: '800', color: COLORS.safe },
-  altSafeBadge: { paddingHorizontal: 6, paddingVertical: 2, borderRadius: 6 },
+  altSafeBadge: { flexDirection: 'row', alignItems: 'center', gap: 3, paddingHorizontal: 6, paddingVertical: 2, borderRadius: 6 },
   altSafeBadgeText: { fontSize: 10, fontWeight: '700' },
   altRouteDetail: { fontSize: 11, fontWeight: '600', color: COLORS.textMuted },
   altRouteDanger: { fontSize: 10, color: COLORS.warning, fontWeight: '600', marginTop: 1 },
@@ -1005,13 +1131,15 @@ const getStyles = (COLORS, isDarkMode) => StyleSheet.create({
   dataUnit: { fontSize: 14, fontWeight: '600', color: COLORS.textMuted },
 
   hardwareRow: { flexDirection: 'column', gap: 6, marginTop: 4 },
-  hwIcon: {
-    fontSize: 12, fontWeight: '700', color: COLORS.textMuted,
+  hwChip: {
+    flexDirection: 'row', alignItems: 'center', gap: 5,
     backgroundColor: isDarkMode ? COLORS.border : COLORS.background, paddingHorizontal: 8, paddingVertical: 4,
-    borderRadius: 6, overflow: 'hidden', alignSelf: 'flex-start',
+    borderRadius: 6, alignSelf: 'flex-start',
   },
+  hwChipText: { fontSize: 12, fontWeight: '700', color: COLORS.textMuted },
 
   actionRow: { flexDirection: 'row', gap: 12 },
+  btnContent: { flexDirection: 'row', alignItems: 'center', gap: 6 },
   primaryButton: { flex: 1, backgroundColor: COLORS.primary, paddingVertical: 14, borderRadius: 16, alignItems: 'center' },
   primaryButtonText: { color: '#FFF', fontSize: 14, fontWeight: '700' },
   secondaryButton: { flex: 1, backgroundColor: COLORS.primary + '15', paddingVertical: 14, borderRadius: 16, alignItems: 'center' },

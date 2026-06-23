@@ -84,6 +84,14 @@ android {
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
         versionName "1.0"
+
+        // Google Maps API key dibaca dari local.properties (tidak di-commit)
+        def localProps = new Properties()
+        def localPropsFile = rootProject.file("local.properties")
+        if (localPropsFile.exists()) {
+            localProps.load(new FileInputStream(localPropsFile))
+        }
+        manifestPlaceholders = [GOOGLE_MAPS_API_KEY: localProps.getProperty("GOOGLE_MAPS_API_KEY", "")]
     }
     packagingOptions {
         pickFirst 'lib/x86/libc++_shared.so'

@@ -11,6 +11,9 @@ import { buildNodes } from '../config/nodes';
 // Import Global Theme Context
 import { ThemeContext } from '../context/ThemeContext';
 
+// Visualisasi animasi tinggi sungai
+import RiverLevelVisual from '../components/RiverLevelVisual';
+
 // Palet warna premium (Ultra-Clean Slate & Sky UI) - Light Mode
 const LIGHT_COLORS = {
   background: '#F8FAFC',
@@ -43,6 +46,9 @@ const DARK_COLORS = {
 
 const FALLBACK_REGION = { latitude: -7.2800, longitude: 112.7950 };
 
+// Interval polling AJAX untuk refresh data titik pantau secara live (ms)
+const POLL_INTERVAL = 15000;
+
 const DashboardScreen = ({ navigation }) => {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -70,20 +76,22 @@ const DashboardScreen = ({ navigation }) => {
 
 
   // 1. Fetch Data Utama (Sensor Node dari Backend Arthur)
-  const fetchData = useCallback(async () => {
-    setLoading(true);
+  // silent = true dipakai polling otomatis agar tidak memunculkan loading spinner
+  const fetchData = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
     try {
       // Mengambil lokasi dan log terbaru dari API
       const [locations, logs] = await Promise.all([getLocations(), getLogs()]);
-      
+
       // Memproses data mentah menjadi bentuk Node menggunakan fungsi buildNodes
       const processedNodes = buildNodes(locations || [], logs || []);
       setNodes(processedNodes);
     } catch (error) {
       console.error("Gagal menyinkronkan data node:", error);
-      setNodes([]);
+      // Polling silent: pertahankan data lama agar UI tidak berkedip kosong
+      if (!silent) setNodes([]);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }, []);
 
@@ -111,6 +119,9 @@ const DashboardScreen = ({ navigation }) => {
 
   useEffect(() => {
     fetchData();
+    // Polling AJAX: refresh data titik pantau secara live tiap POLL_INTERVAL
+    const timer = setInterval(() => fetchData(true), POLL_INTERVAL);
+    return () => clearInterval(timer);
   }, [fetchData]);
 
   // Pull to refresh hanya memperbarui status sensor node, BUKAN twitter
@@ -124,6 +135,11 @@ const DashboardScreen = ({ navigation }) => {
   const totalNodes = nodes.length;
   const dangerNodes = nodes.filter(n => n.status.risk === 'BAHAYA' || n.status.risk === 'WASPADA').length;
   const safeNodes = totalNodes - dangerNodes;
+
+  // Node paling kritis (air tertinggi) untuk divisualisasikan — hanya sensor ketinggian, bukan alat kecil biner
+  const featuredNode = nodes
+    .filter(n => !n.isBinary)
+    .reduce((top, n) => (!top || n.status.level_cm > top.status.level_cm ? n : top), null);
 
   if (loading) {
     return (
@@ -262,6 +278,11 @@ const DashboardScreen = ({ navigation }) => {
           </ScrollView>
         )}
 
+        {/* --- SECTION: Visualisasi Tinggi Sungai (Animasi) --- */}
+        {featuredNode && (
+          <RiverLevelVisual node={featuredNode} themeColors={themeColors} isDarkMode={isDarkMode} />
+        )}
+
         {/* Section: Titik Pantau */}
         <View style={styles.sectionHeader}>
           <Text style={[styles.sectionTitle, dynamicStyles.textMain]}>Status Titik Pantau</Text>
@@ -303,15 +324,21 @@ const DashboardScreen = ({ navigation }) => {
 
               <View style={[styles.nodeWidgetBottom, { borderTopColor: themeColors.border }]}>
                 <View style={styles.metricArea}>
-                  <Text style={[styles.metricValue, dynamicStyles.textMain]}>{(node.status.level_cm / 100).toFixed(2)}</Text>
-                  <Text style={[styles.metricUnit, dynamicStyles.textMuted]}>Meter</Text>
+                  {node.isBinary ? (
+                    <Text style={[styles.metricValue, { color: node.status.color }]}>{node.status.flood ? 'Banjir' : 'Kering'}</Text>
+                  ) : (
+                    <>
+                      <Text style={[styles.metricValue, dynamicStyles.textMain]}>{(node.status.level_cm / 100).toFixed(2)}</Text>
+                      <Text style={[styles.metricUnit, dynamicStyles.textMuted]}>Meter</Text>
+                    </>
+                  )}
                 </View>
-                
+
                 <View style={styles.hardwareGroup}>
                   {node.hardware.has_sensor && (
                     <View style={[styles.hardwareBadge, dynamicStyles.hardwareBadgeBg]}>
-                      <Icon name="water-outline" size={12} color={themeColors.textMuted} />
-                      <Text style={[styles.hardwareText, dynamicStyles.textMuted]}>Sensor</Text>
+                      <Icon name={node.isBinary ? 'hardware-chip-outline' : 'water-outline'} size={12} color={themeColors.textMuted} />
+                      <Text style={[styles.hardwareText, dynamicStyles.textMuted]}>{node.isBinary ? 'Alat Kecil' : 'Sensor'}</Text>
                     </View>
                   )}
                   {node.hardware.has_camera && (

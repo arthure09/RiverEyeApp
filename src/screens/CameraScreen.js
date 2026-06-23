@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback, useContext, useMemo } from 'react';
 import { View, Text, StyleSheet, ActivityIndicator, SafeAreaView, StatusBar, TouchableOpacity, Platform } from 'react-native';
 import Video from 'react-native-video';
+import { WebView } from 'react-native-webview';
 import Icon from 'react-native-vector-icons/Ionicons';
 import { getLocations } from '../config/apiClient';
 
@@ -33,6 +34,17 @@ const DARK_COLORS = {
 
 // Stream cadangan jika node belum punya cctv_url dari backend
 const PLACEHOLDER_STREAM = 'https://www.w3schools.com/html/mov_bbb.mp4';
+
+// react-native-video hanya mendukung file video/HLS/DASH; MJPEG harus lewat WebView.
+const isFileVideo = (url) => /\.(mp4|m3u8|mpd)(\?|$)/i.test(url || '');
+
+// MJPEG (multipart/x-mixed-replace) diputar via tag <img> di dalam WebView.
+const mjpegHtml = (url) =>
+  '<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">' +
+  '</head><body style="margin:0;padding:0;background:#0F172A;overflow:hidden;">' +
+  `<img src="${url}" style="width:100vw;height:100vh;object-fit:cover;" ` +
+  'onload="window.ReactNativeWebView.postMessage(\'loaded\')" ' +
+  'onerror="window.ReactNativeWebView.postMessage(\'error\')"/></body></html>';
 
 // Pilih node berkamera acak (selain yang sedang aktif)
 const pickRandom = (list, exclude) => {
@@ -126,6 +138,9 @@ const CameraScreen = ({ route, navigation }) => {
     );
   }
 
+  // URL stream aktif (fallback ke placeholder bila node belum punya cctv_url)
+  const streamUrl = activeNode.cctvUrl || PLACEHOLDER_STREAM;
+
   return (
     <SafeAreaView style={styles.container}>
       <StatusBar barStyle={isDarkMode ? 'light-content' : 'dark-content'} backgroundColor={themeColors.background} />
@@ -164,10 +179,10 @@ const CameraScreen = ({ route, navigation }) => {
               <Text style={styles.errorIcon}>📵</Text>
               <Text style={styles.errorText}>Kamera offline atau koneksi terputus.</Text>
             </View>
-          ) : (
+          ) : isFileVideo(streamUrl) ? (
             <Video
               key={refreshKey}
-              source={{ uri: activeNode.cctvUrl || PLACEHOLDER_STREAM }}
+              source={{ uri: streamUrl }}
               style={styles.videoPlayer}
               resizeMode="cover"
               onReadyForDisplay={() => setIsBuffering(false)}
@@ -177,6 +192,23 @@ const CameraScreen = ({ route, navigation }) => {
               controls={false}
               repeat={true}
               muted={true}
+            />
+          ) : (
+            <WebView
+              key={refreshKey}
+              source={{ html: mjpegHtml(streamUrl) }}
+              style={styles.videoPlayer}
+              originWhitelist={['*']}
+              mixedContentMode="always"
+              scrollEnabled={false}
+              javaScriptEnabled
+              domStorageEnabled
+              allowsInlineMediaPlayback
+              onMessage={(e) => {
+                const msg = e.nativeEvent.data;
+                if (msg === 'loaded') setIsBuffering(false);
+                else if (msg === 'error') { setIsBuffering(false); setVideoError(true); }
+              }}
             />
           )}
 
