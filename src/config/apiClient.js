@@ -7,7 +7,7 @@
  */
 
 import axios from 'axios';
-import { BASE_URL, API_TIMEOUT, ENDPOINTS } from './api';
+import { BASE_URL, SENSOR_BASE_URL, API_TIMEOUT, ENDPOINTS, SENSOR_ENDPOINTS } from './api';
 
 // Buat instance axios dengan konfigurasi default
 const apiClient = axios.create({
@@ -147,6 +147,34 @@ export const postPrediction = async (predictionData, apiKey) => {
       headers: { 'x-api-key': apiKey },
     });
     return handleResponse(response);
+  } catch (error) {
+    handleError(error);
+  }
+};
+
+// ============================================================
+//  Sensor client — water.serverlucas.my.id (Lucas)
+// ============================================================
+
+const sensorClient = axios.create({
+  baseURL: SENSOR_BASE_URL,
+  timeout: API_TIMEOUT,
+  headers: { 'Content-Type': 'application/json' },
+});
+
+/**
+ * Mengambil riwayat pembacaan sensor ESP32
+ * @param {Object} [opts]
+ * @param {string} [opts.deviceId] - Filter per node
+ * @param {number} [opts.limit=50]   - Jumlah maksimal data
+ * @returns {Promise<Array>}
+ */
+export const getReadings = async ({ deviceId, limit = 50 } = {}) => {
+  try {
+    const params = { limit };
+    if (deviceId) params.device_id = deviceId;
+    const response = await sensorClient.get(SENSOR_ENDPOINTS.READINGS, { params });
+    return response.data?.data ?? [];
   } catch (error) {
     handleError(error);
   }

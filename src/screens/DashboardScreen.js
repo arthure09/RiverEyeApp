@@ -5,8 +5,11 @@ import Icon from 'react-native-vector-icons/Ionicons';
 import axios from 'axios'; 
 
 // Import fungsi API dan pemroses Node sesungguhnya dari Backend
-import { getLocations, getLogs } from '../config/apiClient';
+import { getLocations, getLogs, getReadings } from '../config/apiClient';
 import { buildNodes } from '../config/nodes';
+import { getRiskFromPercent } from '../config/api';
+import useWaterLevelWS from '../hooks/useWaterLevelWS';
+import { checkSensorRisk, checkNodeRisk, checkNodeListChanges } from '../services/alertNotifier';
 
 // Import Global Theme Context
 import { ThemeContext } from '../context/ThemeContext';
@@ -67,9 +70,18 @@ const DashboardScreen = ({ navigation }) => {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [nodes, setNodes] = useState([]);
-  
+
+  // Sensor ESP32 (water.serverlucas.my.id) — data terbaru per device
+  const [latestReadings, setLatestReadings] = useState({});
+  const [loadingSensor, setLoadingSensor] = useState(true);
+  const { latestReading, isConnected } = useWaterLevelWS();
+
+  // Flag agar notifikasi tidak muncul saat pertama kali data dimuat
+  const nodeSeeded = React.useRef(false);
+  const sensorSeeded = React.useRef(false);
+
   // State khusus untuk Twitter Feeds
-  const [tweets, setTweets] = useState([]); 
+  const [tweets, setTweets] = useState([]);
   const [loadingTweets, setLoadingTweets] = useState(false);
 
   // MENGAMBIL STATE DARI GLOBAL CONTEXT
@@ -100,6 +112,18 @@ const DashboardScreen = ({ navigation }) => {
       // Memproses data mentah menjadi bentuk Node menggunakan fungsi buildNodes
       const processedNodes = buildNodes(locations || [], logs || []);
       setNodes(processedNodes);
+
+      // Deteksi node baru / dihapus (panggilan pertama hanya menyemai, tidak notifikasi)
+      checkNodeListChanges(processedNodes);
+
+      if (!nodeSeeded.current) {
+        // Load pertama: seed state risiko tanpa notifikasi
+        processedNodes.forEach(n => checkNodeRisk(n.id, n.name, n.status.risk, n.status.level_cm));
+        nodeSeeded.current = true;
+      } else {
+        // Polling berikutnya: notifikasi jika ada node yang memburuk
+        processedNodes.forEach(n => checkNodeRisk(n.id, n.name, n.status.risk, n.status.level_cm));
+      }
     } catch (error) {
       console.error("Gagal menyinkronkan data node:", error);
       // Polling silent: pertahankan data lama agar UI tidak berkedip kosong
@@ -109,20 +133,52 @@ const DashboardScreen = ({ navigation }) => {
     }
   }, []);
 
-  // 2. Fetch Data Twitter (Super Cepat via Database n8n)
+  // 2. Fetch data sensor awal dari REST, lalu update realtime via WebSocket
+  const fetchSensorData = useCallback(async () => {
+    try {
+      const readings = await getReadings({ limit: 100 });
+      const byDevice = {};
+      (readings || []).forEach(r => {
+        const prev = byDevice[r.device_id];
+        if (!prev || new Date(r.created_at) > new Date(prev.created_at)) {
+          byDevice[r.device_id] = r;
+        }
+      });
+      setLatestReadings(byDevice);
+
+      if (!sensorSeeded.current) {
+        // Load pertama: seed state risiko sensor tanpa notifikasi
+        Object.values(byDevice).forEach(r => {
+          const risk = getRiskFromPercent(r.water_level_percent);
+          checkSensorRisk(r.device_id, risk.text, r.water_level_percent);
+        });
+        sensorSeeded.current = true;
+      }
+    } catch (e) {
+      console.error('Gagal mengambil data sensor:', e);
+    } finally {
+      setLoadingSensor(false);
+    }
+  }, []);
+
+  // WebSocket update: sinkronkan pembacaan terbaru + cek peringatan
+  useEffect(() => {
+    if (!latestReading) return;
+    setLatestReadings(prev => ({ ...prev, [latestReading.device_id]: latestReading }));
+    const risk = getRiskFromPercent(latestReading.water_level_percent);
+    checkSensorRisk(latestReading.device_id, risk.text, latestReading.water_level_percent);
+  }, [latestReading]);
+
+  // 3. Fetch Data Twitter (otomatis dipanggil saat aplikasi dibuka)
   const fetchTweets = useCallback(async () => {
     setLoadingTweets(true);
     try {
-      // Pastikan IP Tailscale Mac Anda benar di sini
-      // URL diarahkan ke get-stored-tweets agar membaca dari Supabase
       const response = await axios.get('http://100.71.62.7:5678/webhook/get-live-tweets');
-      
+
       if (response.data && Array.isArray(response.data)) {
-        // Kalkulasi ulang waktu relatif secara dinamis menggunakan tweet_timestamp
         const dynamicTweets = response.data.map(tweet => ({
           ...tweet,
-          // Mengabaikan tweet.time bawaan (statis), pakai hasil perhitungan real-time
-          time: tweet.tweet_timestamp ? getRelativeTime(tweet.tweet_timestamp) : tweet.time 
+          time: tweet.tweet_timestamp ? getRelativeTime(tweet.tweet_timestamp) : tweet.time,
         }));
         setTweets(dynamicTweets);
       } else {
@@ -131,7 +187,7 @@ const DashboardScreen = ({ navigation }) => {
     } catch (error) {
       console.log("Error mengambil tweets dari n8n:", error);
       setTweets([
-        { id: 'err-1', username: 'Sistem', handle: '@RiverEye', text: 'Gagal mengambil laporan warga terbaru. Coba lagi nanti.', time: 'Now' }
+        { id: 'err-1', username: 'Sistem', handle: '@RiverEye', text: 'Gagal mengambil laporan warga terbaru. Coba lagi nanti.', time: 'Now' },
       ]);
     } finally {
       setLoadingTweets(false);
@@ -140,19 +196,18 @@ const DashboardScreen = ({ navigation }) => {
 
   useEffect(() => {
     fetchData();
-    fetchTweets(); // <-- PANGGIL OTOMATIS: Laporan warga langsung muncul saat aplikasi dibuka
-    
-    // Polling AJAX: refresh data titik pantau secara live tiap POLL_INTERVAL
+    fetchSensorData();
+    fetchTweets();
     const timer = setInterval(() => fetchData(true), POLL_INTERVAL);
     return () => clearInterval(timer);
-  }, [fetchData, fetchTweets]);
+  }, [fetchData, fetchSensorData, fetchTweets]);
 
-  // Pull to refresh hanya memperbarui status sensor node, BUKAN twitter
+  // Pull to refresh: perbarui node pantau + sensor ESP32
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
-    await fetchData();
+    await Promise.all([fetchData(), fetchSensorData()]);
     setRefreshing(false);
-  }, [fetchData]);
+  }, [fetchData, fetchSensorData]);
 
   // Statistik Jaringan
   const totalNodes = nodes.length;
@@ -247,6 +302,78 @@ const DashboardScreen = ({ navigation }) => {
             <Text style={[styles.summaryLabel, dynamicStyles.textMuted]}>Aman</Text>
           </View>
         </View>
+
+        {/* --- SECTION: Pembacaan Sensor ESP32 (Realtime) --- */}
+        <View style={styles.sectionHeader}>
+          <View style={styles.sectionTitleRow}>
+            <Text style={[styles.sectionTitle, dynamicStyles.textMain]}>Pembacaan Sensor</Text>
+            <View style={[styles.liveBadge, { backgroundColor: (isConnected ? themeColors.safe : themeColors.danger) + '20' }]}>
+              <View style={[styles.pulseDot, { backgroundColor: isConnected ? themeColors.safe : themeColors.danger }]} />
+              <Text style={[styles.liveBadgeText, { color: isConnected ? themeColors.safe : themeColors.danger }]}>
+                {isConnected ? 'LIVE' : 'OFFLINE'}
+              </Text>
+            </View>
+          </View>
+        </View>
+
+        {loadingSensor ? (
+          <ActivityIndicator color={themeColors.primary} style={{ marginBottom: 24 }} />
+        ) : Object.keys(latestReadings).length === 0 ? (
+          <View style={[styles.emptyTweetContainer, dynamicStyles.cardBg, dynamicStyles.borderColor]}>
+            <Icon name="water-outline" size={32} color={themeColors.border} />
+            <Text style={[styles.emptyTweetText, dynamicStyles.textMuted]}>Belum ada data sensor tersedia.</Text>
+          </View>
+        ) : (
+          Object.values(latestReadings).map(reading => {
+            const risk = getRiskFromPercent(reading.water_level_percent);
+            return (
+              <View key={reading.device_id} style={[styles.sensorCard, dynamicStyles.cardBg, dynamicStyles.shadowColor]}>
+                <View style={styles.sensorCardTop}>
+                  <View style={styles.nodeWidgetLeft}>
+                    <View style={[styles.iconContainer, { backgroundColor: risk.color + (isDarkMode ? '25' : '15') }]}>
+                      <Icon name="hardware-chip-outline" size={18} color={risk.color} />
+                    </View>
+                    <View style={styles.nodeTitleArea}>
+                      <Text style={[styles.nodeName, dynamicStyles.textMain]}>{reading.device_id}</Text>
+                      <Text style={[styles.nodeId, dynamicStyles.textMuted]}>
+                        {new Date(reading.created_at).toLocaleString('id-ID', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })}
+                      </Text>
+                    </View>
+                  </View>
+                  <View style={[styles.statusPill, { backgroundColor: risk.color + (isDarkMode ? '25' : '15') }]}>
+                    <View style={[styles.statusDot, { backgroundColor: risk.color }]} />
+                    <Text style={[styles.statusText, { color: risk.color }]}>{risk.text.toUpperCase()}</Text>
+                  </View>
+                </View>
+
+                <View style={styles.sensorLevelRow}>
+                  <Text style={[styles.metricValue, dynamicStyles.textMain]}>
+                    {reading.water_level_percent.toFixed(1)}
+                  </Text>
+                  <Text style={[styles.metricUnit, dynamicStyles.textMuted]}>%</Text>
+                </View>
+
+                <View style={[styles.progressBarBg, { backgroundColor: themeColors.border }]}>
+                  <View
+                    style={[
+                      styles.progressBarFill,
+                      { width: `${Math.min(reading.water_level_percent, 100)}%`, backgroundColor: risk.color },
+                    ]}
+                  />
+                </View>
+
+                {reading.battery_voltage != null && (
+                  <View style={styles.sensorMetaRow}>
+                    <Icon name="battery-half-outline" size={12} color={themeColors.textMuted} />
+                    <Text style={[styles.sensorMetaText, dynamicStyles.textMuted]}>
+                      {reading.battery_voltage.toFixed(2)} V
+                    </Text>
+                  </View>
+                )}
+              </View>
+            );
+          })
+        )}
 
         {/* --- SECTION: Twitter Live Feeds (Manual Fetch) --- */}
         <View style={styles.sectionHeader}>
@@ -492,6 +619,14 @@ const styles = StyleSheet.create({
 
   loadingContainer: { flex: 1, justifyContent: 'center', alignItems: 'center' },
   loadingText: { marginTop: 16, fontWeight: '500', fontSize: 14 },
+
+  sensorCard: { borderRadius: 20, padding: 16, marginBottom: 16, shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.02, shadowRadius: 12, elevation: 1 },
+  sensorCardTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
+  sensorLevelRow: { flexDirection: 'row', alignItems: 'baseline', marginBottom: 10 },
+  progressBarBg: { height: 6, borderRadius: 3, marginBottom: 10, overflow: 'hidden' },
+  progressBarFill: { height: 6, borderRadius: 3 },
+  sensorMetaRow: { flexDirection: 'row', alignItems: 'center', gap: 4 },
+  sensorMetaText: { fontSize: 11, fontWeight: '600' },
 });
 
 // Google Maps Dark Theme Style Json

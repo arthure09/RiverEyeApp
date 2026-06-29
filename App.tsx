@@ -1,8 +1,11 @@
-import React, { useContext } from 'react';
-import { NavigationContainer } from '@react-navigation/native';
+import React, { useContext, useEffect } from 'react';
+import { NavigationContainer, createNavigationContainerRef } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
-import Icon from 'react-native-vector-icons/Ionicons'; 
-import { SafeAreaProvider } from 'react-native-safe-area-context'; 
+import Icon from 'react-native-vector-icons/Ionicons';
+import { AppState } from 'react-native';
+import { SafeAreaProvider } from 'react-native-safe-area-context';
+import notifee, { EventType } from '@notifee/react-native';
+import { startNtfyListener, stopNtfyListener } from './src/services/ntfyListener';
 
 // Import Screens
 import DashboardScreen from './src/screens/DashboardScreen';
@@ -22,6 +25,9 @@ type RootTabParamList = {
 };
 
 const Tab = createBottomTabNavigator<RootTabParamList>();
+
+// Ref navigasi global — dipakai handler notifikasi di luar komponen React
+export const navigationRef = createNavigationContainerRef<RootTabParamList>();
 
 // 2. Palet warna dinamis untuk Tab Bar
 const LIGHT_COLORS = {
@@ -101,11 +107,36 @@ function MainNavigator() {
 
 // 4. Komponen App Utama yang membungkus seluruh aplikasi dengan Provider
 export default function App() {
+  useEffect(() => {
+    // Minta izin notifikasi dan mulai listener ntfy saat app dibuka
+    notifee.requestPermission();
+    startNtfyListener();
+
+    // Buka tab Beranda saat notifikasi diklik dan app sedang foreground
+    const unsubForeground = notifee.onForegroundEvent(({ type }) => {
+      if (type === EventType.PRESS && navigationRef.isReady()) {
+        navigationRef.navigate('Beranda');
+      }
+    });
+
+    // Reconnect WebSocket setelah app kembali ke foreground dari background
+    const appStateSub = AppState.addEventListener('change', nextState => {
+      if (nextState === 'active') {
+        startNtfyListener(); // idempoten — tidak membuat koneksi baru jika sudah terhubung
+      }
+    });
+
+    return () => {
+      stopNtfyListener();
+      unsubForeground();
+      appStateSub.remove();
+    };
+  }, []);
+
   return (
-    // Tambahkan style flex 1 agar memastikan layar tidak menciut menjadi 0px
     <SafeAreaProvider style={{ flex: 1 }}>
       <ThemeProvider>
-        <NavigationContainer>
+        <NavigationContainer ref={navigationRef}>
           <MainNavigator />
         </NavigationContainer>
       </ThemeProvider>

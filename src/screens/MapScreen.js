@@ -68,6 +68,16 @@ const decodePolyline = (encoded) => {
   return pts;
 };
 
+// Hitung sudut arah perjalanan (bearing) dari titik A ke titik B (0° = Utara)
+const bearingBetween = (lat1, lon1, lat2, lon2) => {
+  const φ1 = lat1 * Math.PI / 180;
+  const φ2 = lat2 * Math.PI / 180;
+  const Δλ = (lon2 - lon1) * Math.PI / 180;
+  const y = Math.sin(Δλ) * Math.cos(φ2);
+  const x = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ);
+  return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+};
+
 const haversine = (lat1, lon1, lat2, lon2) => {
   const R = 6371000;
   const dLat = (lat2 - lat1) * Math.PI / 180;
@@ -80,11 +90,10 @@ const haversine = (lat1, lon1, lat2, lon2) => {
 
 // Cari titik pantau berstatus SIAGA atau WASPADA yang dilewati sebuah rute.
 const findHazardsNearRoute = (coords, nodes) => {
-  const THRESHOLD = 500;
+  const THRESHOLD = 100; // sensor dalam radius 100 m dari titik rute dianggap berbahaya
   return nodes.filter(n =>
     (n.status.risk === 'BAHAYA' || n.status.risk === 'WASPADA') &&
-    coords.some((pt, i) =>
-      i % 5 === 0 &&
+    coords.some(pt =>
       haversine(pt.latitude, pt.longitude, n.coordinates.latitude, n.coordinates.longitude) < THRESHOLD
     )
   );
@@ -175,6 +184,40 @@ const fetchPlaceSuggestions = async (text) => {
 
 const ROUTE_LABELS = ['Rute Utama', 'Alternatif 1', 'Alternatif 2'];
 
+// Split polyline rute menjadi segmen sudah dilewati (abu-abu) dan belum (berwarna).
+const splitRouteAtPosition = (coords, userPos) => {
+  if (!userPos || coords.length < 2) return { passed: [], ahead: [...coords] };
+  let minDist = Infinity;
+  let splitIdx = 0;
+  coords.forEach((pt, i) => {
+    const d = haversine(userPos.latitude, userPos.longitude, pt.latitude, pt.longitude);
+    if (d < minDist) { minDist = d; splitIdx = i; }
+  });
+  return {
+    passed: splitIdx > 0 ? coords.slice(0, splitIdx + 1) : [],
+    ahead: coords.slice(Math.max(0, splitIdx)),
+  };
+};
+
+// Zoom adaptif berdasarkan jarak ke belokan berikutnya.
+const calcNavZoom = (distToTurnM) => {
+  if (distToTurnM < 60) return 19;
+  if (distToTurnM < 200) return 18;
+  if (distToTurnM < 600) return 17;
+  return 16;
+};
+
+// Peta jenis manuver Google Directions ke Ionicons
+const maneuverIcon = (maneuver = '') => {
+  if (maneuver.includes('uturn')) return 'return-down-back';
+  if (maneuver.includes('roundabout')) return 'refresh-circle-outline';
+  if (maneuver.includes('left')) return 'arrow-back';
+  if (maneuver.includes('right')) return 'arrow-forward';
+  if (maneuver === 'merge') return 'git-merge-outline';
+  if (maneuver === 'ferry') return 'boat-outline';
+  return 'arrow-up';
+};
+
 const MapScreen = ({ navigation }) => {
   const insets = useSafeAreaInsets();
   const mapRef = useRef(null);
@@ -198,6 +241,32 @@ const MapScreen = ({ navigation }) => {
   const [allRoutes, setAllRoutes] = useState([]);
   const [activeRouteIdx, setActiveRouteIdx] = useState(0);
   const [showWarningCard, setShowWarningCard] = useState(false);
+  const [allRoutesDangerous, setAllRoutesDangerous] = useState(false);
+  const [isNavigating, setIsNavigating] = useState(false);
+  const [navStepIdx, setNavStepIdx] = useState(0);
+  const [navRemaining, setNavRemaining] = useState(null);
+  const [navPosition, setNavPosition] = useState(null);
+  const [navHeading, setNavHeading] = useState(0);
+  const prevNavPositionRef = useRef(null);
+
+  // Kamera navigasi third-person
+  const [isCameraFollowing, setIsCameraFollowing] = useState(true);
+  const isCameraFollowingRef = useRef(true);
+  const navHeadingRef = useRef(0);
+
+  // Route split: segmen dilewati (abu) vs di depan (berwarna)
+  const [passedCoords, setPassedCoords] = useState([]);
+  const [aheadCoords, setAheadCoords] = useState([]);
+
+  // Dynamic re-routing
+  const prevRouteHazardCountRef = useRef(0);
+  const isReroutingRef = useRef(false);
+  const destinationRef = useRef(null);
+
+  // Sensor BAHAYA/WASPADA dalam radius 100 m dari posisi user
+  const [nearbyHazards, setNearbyHazards] = useState([]);
+  const nodesRef = useRef([]);
+  const lastProximityCheckRef = useRef(0);
 
   const [isLoadingLocation, setIsLoadingLocation] = useState(false);
   const [isLoadingRoute, setIsLoadingRoute] = useState(false);
@@ -212,6 +281,9 @@ const MapScreen = ({ navigation }) => {
   // Ruas jalan banjir (>=2 titik siaga) + geometri jalan hasil snap Directions.
   const [floodRoadPaths, setFloodRoadPaths] = useState([]);
   const floodedRoads = useMemo(() => computeFloodedRoads(nodes), [nodes]);
+
+  useEffect(() => { nodesRef.current = nodes; }, [nodes]);
+  useEffect(() => { destinationRef.current = destination; }, [destination]);
 
   const dangerCount = nodes.filter(n => n.status.risk === 'BAHAYA' || n.status.risk === 'WASPADA').length;
   const activeRoute = allRoutes[activeRouteIdx] ?? null;
@@ -282,10 +354,86 @@ const MapScreen = ({ navigation }) => {
 
   const handleUserLocationChange = useCallback((event) => {
     const { coordinate } = event.nativeEvent;
-    if (coordinate) {
-      userLocationRef.current = { latitude: coordinate.latitude, longitude: coordinate.longitude };
-    }
+    if (!coordinate) return;
+    userLocationRef.current = { latitude: coordinate.latitude, longitude: coordinate.longitude };
+
+    // Cek proximity sensor bahaya — throttle 5 detik agar tidak boros render
+    const now = Date.now();
+    if (now - lastProximityCheckRef.current < 5000) return;
+    lastProximityCheckRef.current = now;
+
+    const nearby = nodesRef.current.filter(n =>
+      (n.status.risk === 'BAHAYA' || n.status.risk === 'WASPADA') &&
+      haversine(coordinate.latitude, coordinate.longitude, n.coordinates.latitude, n.coordinates.longitude) < 100
+    );
+    setNearbyHazards(nearby);
   }, []);
+
+  // Tracking posisi, heading, kamera third-person, dan langkah navigasi setiap 3 detik
+  useEffect(() => {
+    if (!isNavigating || !activeRoute) return;
+    const tick = () => {
+      const loc = userLocationRef.current;
+      if (!loc) return;
+
+      // Hitung heading dari posisi sebelumnya (hanya jika bergerak >5m, hindari noise GPS)
+      let currentHeading = navHeadingRef.current;
+      if (prevNavPositionRef.current) {
+        const prev = prevNavPositionRef.current;
+        const moved = haversine(prev.latitude, prev.longitude, loc.latitude, loc.longitude);
+        if (moved > 5) {
+          currentHeading = bearingBetween(prev.latitude, prev.longitude, loc.latitude, loc.longitude);
+          navHeadingRef.current = currentHeading;
+          setNavHeading(currentHeading);
+        }
+      }
+      prevNavPositionRef.current = loc;
+      setNavPosition({ ...loc });
+
+      // Hitung jarak ke belokan berikutnya untuk adaptive zoom
+      const step = activeRoute.steps?.[navStepIdx];
+      const distToTurn = step
+        ? haversine(loc.latitude, loc.longitude, step.endLat, step.endLng)
+        : Infinity;
+      const zoom = calcNavZoom(distToTurn);
+
+      // Kamera third-person: pitch 55°, berotasi mengikuti heading, zoom adaptif
+      if (isCameraFollowingRef.current) {
+        mapRef.current?.animateCamera({
+          center: { latitude: loc.latitude, longitude: loc.longitude },
+          pitch: 55,
+          heading: currentHeading,
+          zoom,
+          altitude: zoom === 19 ? 80 : zoom === 18 ? 150 : zoom === 17 ? 300 : 600,
+        }, { duration: 1000 });
+      }
+
+      // Split rute: bagian sudah dilewati (abu) vs belum (berwarna)
+      if (activeRoute.coords?.length) {
+        const { passed, ahead } = splitRouteAtPosition(activeRoute.coords, loc);
+        setPassedCoords(passed);
+        setAheadCoords(ahead);
+      }
+
+      // Majukan langkah jika sudah dekat titik akhir langkah saat ini (<40 m)
+      if (step) {
+        if (distToTurn < 40 && navStepIdx < (activeRoute.steps?.length ?? 0) - 1) {
+          setNavStepIdx(prev => prev + 1);
+          console.log(`[nav] Maju ke langkah ${navStepIdx + 1}: ${activeRoute.steps[navStepIdx + 1]?.instruction}`);
+        }
+      }
+
+      // Update sisa jarak ke tujuan
+      const dest = activeRoute.coords[activeRoute.coords.length - 1];
+      if (dest) {
+        const rem = haversine(loc.latitude, loc.longitude, dest.latitude, dest.longitude);
+        setNavRemaining({ distance: formatDistance(rem) });
+      }
+    };
+    tick();
+    const interval = setInterval(tick, 3000);
+    return () => clearInterval(interval);
+  }, [isNavigating, activeRoute, navStepIdx]);
 
   const waitForUserLocation = useCallback((timeoutMs = 12000) =>
     new Promise((resolve) => {
@@ -302,7 +450,52 @@ const MapScreen = ({ navigation }) => {
     setAllRoutes([]);
     setActiveRouteIdx(0);
     setShowWarningCard(false);
+    setAllRoutesDangerous(false);
     setDestination(null);
+    setIsNavigating(false);
+    setNavStepIdx(0);
+    setNavRemaining(null);
+  }, []);
+
+  const startNavigation = useCallback(() => {
+    setIsNavigating(true);
+    setNavStepIdx(0);
+    setNavRemaining(null);
+    setIsCameraFollowing(true);
+    isCameraFollowingRef.current = true;
+    navHeadingRef.current = 0;
+    setPassedCoords([]);
+    setAheadCoords(activeRoute?.coords ?? []);
+    // Seed jumlah hazard BAHAYA saat rute dimulai agar re-routing hanya terpicu saat ada yang baru
+    prevRouteHazardCountRef.current = activeRoute
+      ? findHazardsNearRoute(activeRoute.coords, nodesRef.current).filter(n => n.status.risk === 'BAHAYA').length
+      : 0;
+    console.log(`[nav] Navigasi dimulai — ${activeRoute?.steps?.length ?? 0} langkah, hazard awal: ${prevRouteHazardCountRef.current}`);
+    const loc = userLocationRef.current;
+    if (loc) {
+      mapRef.current?.animateCamera({
+        center: { latitude: loc.latitude, longitude: loc.longitude },
+        pitch: 55, heading: 0, zoom: 17, altitude: 300,
+      }, { duration: 800 });
+    }
+  }, [activeRoute]);
+
+  const stopNavigation = useCallback(() => {
+    setIsNavigating(false);
+    setNavStepIdx(0);
+    setNavRemaining(null);
+    setNavPosition(null);
+    setNavHeading(0);
+    setIsCameraFollowing(true);
+    isCameraFollowingRef.current = true;
+    navHeadingRef.current = 0;
+    setPassedCoords([]);
+    setAheadCoords([]);
+    prevNavPositionRef.current = null;
+    prevRouteHazardCountRef.current = 0;
+    isReroutingRef.current = false;
+    // Kembalikan kamera ke top-down setelah navigasi selesai
+    mapRef.current?.animateCamera({ pitch: 0, heading: 0 }, { duration: 600 });
   }, []);
 
   const activateRouting = useCallback(async () => {
@@ -328,6 +521,83 @@ const MapScreen = ({ navigation }) => {
     }
     setIsLoadingLocation(false);
   }, [resetRouteState, waitForUserLocation]);
+
+  // Fetch rute dari Google Directions (+ fallback OSRM), filter & sort.
+  // Dipakai oleh selectSuggestion dan rerouteToDestination.
+  const fetchAndFilterRoutes = useCallback(async (originCoord, destCoord) => {
+    let parsed = null;
+
+    try {
+      const gRes = await fetch(
+        `https://maps.googleapis.com/maps/api/directions/json` +
+        `?origin=${originCoord.latitude},${originCoord.longitude}` +
+        `&destination=${destCoord.latitude},${destCoord.longitude}` +
+        `&alternatives=true&key=${GOOGLE_DIRECTIONS_KEY}`,
+      );
+      const gData = await gRes.json();
+      if (gData.status === 'OK' && gData.routes?.length) {
+        parsed = gData.routes.slice(0, 3).map(r => {
+          const coords = r.legs.flatMap(leg =>
+            leg.steps.flatMap(step => decodePolyline(step.polyline.points))
+          );
+          const leg = r.legs[0];
+          const steps = r.legs.flatMap(l =>
+            l.steps.map(s => ({
+              instruction: s.html_instructions.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim(),
+              distance: formatDistance(s.distance.value),
+              maneuver: s.maneuver || 'straight',
+              endLat: s.end_location.lat,
+              endLng: s.end_location.lng,
+            }))
+          );
+          return { ...buildRoute(coords, formatDistance(leg.distance.value), formatDuration(leg.duration.value), nodesRef.current), steps };
+        });
+        console.log(`[routing] Google Directions: ${parsed.length} rute ditemukan`);
+      }
+    } catch (e) {
+      console.warn('[routing] Google Directions gagal, coba OSRM:', e.message);
+    }
+
+    if (!parsed) {
+      const oRes = await fetch(
+        `https://router.project-osrm.org/route/v1/driving/` +
+        `${originCoord.longitude},${originCoord.latitude};${destCoord.longitude},${destCoord.latitude}` +
+        `?overview=full&geometries=polyline&alternatives=2`,
+      );
+      const oData = await oRes.json();
+      if (oData.code !== 'Ok' || !oData.routes?.length) throw new Error(`OSRM: ${oData.code}`);
+      parsed = oData.routes.slice(0, 3).map(r => {
+        const coords = decodePolyline(r.geometry);
+        return buildRoute(coords, formatDistance(r.distance), formatDuration(r.duration), nodesRef.current);
+      });
+      console.log(`[routing] OSRM fallback: ${parsed.length} rute ditemukan`);
+    }
+
+    // Log keputusan per rute
+    parsed.forEach((r, i) => {
+      const hazardNames = r.hazards.map(h => `${h.name}(${h.status.risk})`).join(', ');
+      console.log(`[routing] Rute ${i + 1}: level=${r.level}, ${r.distance}, ${r.duration}${hazardNames ? `, hazard: ${hazardNames}` : ', bersih'}`);
+    });
+
+    // Hard-exclude BAHAYA — titik siaga tidak pernah dimasukkan kecuali tidak ada jalan lain
+    const ruteAman = parsed.filter(r => r.level !== 'bahaya');
+    const semuaBahaya = ruteAman.length === 0;
+
+    if (semuaBahaya) {
+      console.warn('[routing] FALLBACK: semua rute melewati titik BAHAYA — menampilkan semua dengan peringatan keras');
+    } else {
+      const dihindari = parsed.length - ruteAman.length;
+      if (dihindari > 0) console.log(`[routing] ${dihindari} rute dihapus karena melewati BAHAYA`);
+    }
+
+    // Sort: aman > waspada > bahaya (WASPADA diberi bobot lebih tinggi tapi tetap dipakai jika tidak ada alternatif)
+    const ORDER = { safe: 0, waspada: 1, bahaya: 2 };
+    const ruteFinal = (semuaBahaya ? parsed : ruteAman)
+      .sort((a, b) => (ORDER[a.level] ?? 0) - (ORDER[b.level] ?? 0));
+
+    console.log(`[routing] Rute final: ${ruteFinal.length} pilihan — pilihan terbaik: ${ruteFinal[0]?.level}`);
+    return { routes: ruteFinal, semuaBahaya };
+  }, []);
 
   const cancelRouting = useCallback(() => {
     setIsRoutingMode(false);
@@ -391,47 +661,15 @@ const MapScreen = ({ navigation }) => {
       }
       setDestination({ name: mainText, coordinates: destCoord });
 
-      let parsed = null;
+      console.log(`[routing] Menghitung rute: ${origin.latitude.toFixed(5)},${origin.longitude.toFixed(5)} → ${destCoord.latitude.toFixed(5)},${destCoord.longitude.toFixed(5)}`);
+      const { routes: ruteFinal, semuaBahaya } = await fetchAndFilterRoutes(origin, destCoord);
 
-      try {
-        const gRes = await fetch(
-          `https://maps.googleapis.com/maps/api/directions/json` +
-          `?origin=${origin.latitude},${origin.longitude}` +
-          `&destination=${destCoord.latitude},${destCoord.longitude}` +
-          `&alternatives=true` +
-          `&key=${GOOGLE_DIRECTIONS_KEY}`,
-        );
-        const gData = await gRes.json();
-        if (gData.status === 'OK' && gData.routes?.length) {
-          parsed = gData.routes.slice(0, 3).map(r => {
-            const coords = decodePolyline(r.overview_polyline.points);
-            const leg = r.legs[0];
-            return buildRoute(coords, formatDistance(leg.distance.value), formatDuration(leg.duration.value), nodes);
-          });
-        }
-      } catch { }
-
-      if (!parsed) {
-        const oRes = await fetch(
-          `https://router.project-osrm.org/route/v1/driving/` +
-          `${origin.longitude},${origin.latitude};` +
-          `${destCoord.longitude},${destCoord.latitude}` +
-          `?overview=full&geometries=polyline&alternatives=2`,
-        );
-        const oData = await oRes.json();
-        if (oData.code !== 'Ok' || !oData.routes?.length) throw new Error(oData.code);
-        parsed = oData.routes.slice(0, 3).map(r => {
-          const coords = decodePolyline(r.geometry);
-          return buildRoute(coords, formatDistance(r.distance), formatDuration(r.duration), nodes);
-        });
-      }
-
-      setAllRoutes(parsed);
+      setAllRoutesDangerous(semuaBahaya);
+      setAllRoutes(ruteFinal);
       setActiveRouteIdx(0);
+      setShowWarningCard(true);
 
-      if (!parsed[0].isSafe) setShowWarningCard(true);
-
-      mapRef.current?.fitToCoordinates(parsed[0].coords, {
+      mapRef.current?.fitToCoordinates(ruteFinal[0].coords, {
         edgePadding: { top: 260, right: 40, bottom: 200, left: 40 },
         animated: true,
       });
@@ -442,7 +680,68 @@ const MapScreen = ({ navigation }) => {
     } finally {
       setIsLoadingRoute(false);
     }
-  }, [origin, resetRouteState, nodes]);
+  }, [origin, resetRouteState, fetchAndFilterRoutes]);
+
+  // Re-routing dari posisi saat ini ke tujuan yang sama (dipanggil saat sensor berubah)
+  const rerouteToDestination = useCallback(async (originCoord, dest) => {
+    if (isReroutingRef.current || !dest) return;
+    isReroutingRef.current = true;
+    console.log('[routing] Memulai kalkulasi ulang rute dari posisi saat ini...');
+    stopNavigation();
+    setIsLoadingRoute(true);
+    setDestination(dest);
+    setSearchQuery(dest.name);
+
+    try {
+      const { routes: ruteFinal, semuaBahaya } = await fetchAndFilterRoutes(originCoord, dest.coordinates);
+      setAllRoutesDangerous(semuaBahaya);
+      setAllRoutes(ruteFinal);
+      setActiveRouteIdx(0);
+      setShowWarningCard(true);
+      mapRef.current?.fitToCoordinates(ruteFinal[0].coords, {
+        edgePadding: { top: 260, right: 40, bottom: 200, left: 40 },
+        animated: true,
+      });
+      console.log(`[routing] Rute ulang selesai — ${ruteFinal.length} pilihan, level terbaik: ${ruteFinal[0]?.level}`);
+    } catch (e) {
+      console.error('[routing] Kalkulasi ulang gagal:', e.message);
+      Alert.alert('Re-routing Gagal', 'Tidak dapat menghitung rute alternatif. Coba cari rute ulang secara manual.');
+    } finally {
+      setIsLoadingRoute(false);
+      isReroutingRef.current = false;
+    }
+  }, [stopNavigation, fetchAndFilterRoutes]);
+
+  // Dynamic re-routing: pantau perubahan sensor saat navigasi aktif
+  useEffect(() => {
+    if (!isNavigating || !activeRoute) return;
+
+    const bahayaHazards = findHazardsNearRoute(activeRoute.coords, nodes)
+      .filter(n => n.status.risk === 'BAHAYA');
+    const count = bahayaHazards.length;
+
+    if (count > prevRouteHazardCountRef.current) {
+      const newNames = bahayaHazards.map(n => n.name).join(', ');
+      console.warn(`[routing] ⚠️ Bahaya BARU pada rute aktif (${count} titik): ${newNames} — memicu re-routing`);
+      prevRouteHazardCountRef.current = count;
+
+      const loc = userLocationRef.current;
+      const dest = destinationRef.current;
+
+      Alert.alert(
+        '⚠️ Bahaya Terdeteksi di Rute',
+        `Sensor mendeteksi titik BAHAYA baru:\n${newNames}\n\nMenghitung ulang rute yang aman...`,
+        [{
+          text: 'OK',
+          onPress: () => {
+            if (loc && dest) rerouteToDestination(loc, dest);
+          },
+        }],
+      );
+    } else {
+      prevRouteHazardCountRef.current = count;
+    }
+  }, [nodes, isNavigating, activeRoute, rerouteToDestination]);
 
   const searchOriginPlaces = useCallback(async (text) => {
     if (text.length < 3) { setOriginSuggestions([]); return; }
@@ -556,6 +855,18 @@ const MapScreen = ({ navigation }) => {
     }
   }, [allRoutes]);
 
+  const openInGoogleMaps = useCallback(() => {
+    if (!origin || !destination) return;
+    const url =
+      `https://www.google.com/maps/dir/?api=1` +
+      `&origin=${origin.latitude},${origin.longitude}` +
+      `&destination=${destination.coordinates.latitude},${destination.coordinates.longitude}` +
+      `&travelmode=driving`;
+    Linking.openURL(url).catch(() =>
+      Alert.alert('Gagal', 'Tidak dapat membuka Google Maps.'),
+    );
+  }, [origin, destination]);
+
   const handleMarkerPress = (node) => {
     if (isRoutingMode) return;
     setSelectedNode(node);
@@ -582,6 +893,12 @@ const MapScreen = ({ navigation }) => {
         showsMyLocationButton={false}
         onUserLocationChange={handleUserLocationChange}
         onPress={() => { if (!isRoutingMode) setSelectedNode(null); }}
+        onPanDrag={() => {
+          if (isNavigating && isCameraFollowingRef.current) {
+            isCameraFollowingRef.current = false;
+            setIsCameraFollowing(false);
+          }
+        }}
       >
         {/* Overlay merah untuk ruas jalan banjir (>=2 titik siaga) */}
         {floodRoadPaths.map((road) => {
@@ -623,6 +940,23 @@ const MapScreen = ({ navigation }) => {
           </Marker>
         )}
 
+        {/* Panah navigasi — bergerak & berotasi mengikuti arah perjalanan */}
+        {isNavigating && navPosition && (
+          <Marker
+            coordinate={navPosition}
+            anchor={{ x: 0.5, y: 0.5 }}
+            rotation={navHeading}
+            flat
+            tracksViewChanges
+          >
+            <View style={styles.navArrowOuter}>
+              <View style={styles.navArrowCircle}>
+                <Icon name="navigate" size={20} color="#FFFFFF" />
+              </View>
+            </View>
+          </Marker>
+        )}
+
         {destination && (
           <Marker coordinate={destination.coordinates} anchor={{ x: 0.5, y: 1 }}>
             <View style={styles.destMarkerWrapper}>
@@ -633,6 +967,7 @@ const MapScreen = ({ navigation }) => {
           </Marker>
         )}
 
+        {/* Rute alternatif (tidak aktif) */}
         {allRoutes.map((route, idx) => idx !== activeRouteIdx && (
           <Polyline
             key={`route-${idx}`}
@@ -642,7 +977,9 @@ const MapScreen = ({ navigation }) => {
             lineDashPattern={route.isSafe ? undefined : [10, 6]}
           />
         ))}
-        {activeRoute && (
+
+        {/* Rute aktif — split: sudah dilewati (abu) + belum (berwarna tebal) */}
+        {activeRoute && !isNavigating && (
           <Polyline
             key="route-active"
             coordinates={activeRoute.coords}
@@ -651,10 +988,66 @@ const MapScreen = ({ navigation }) => {
             lineDashPattern={activeRoute.isSafe ? undefined : [10, 6]}
           />
         )}
+        {activeRoute && isNavigating && passedCoords.length > 1 && (
+          <Polyline
+            key="route-passed"
+            coordinates={passedCoords}
+            strokeColor="rgba(150,150,150,0.55)"
+            strokeWidth={5}
+          />
+        )}
+        {activeRoute && isNavigating && aheadCoords.length > 1 && (
+          <Polyline
+            key="route-ahead"
+            coordinates={aheadCoords}
+            strokeColor={activeRoute.isSafe ? routeColors[activeRouteIdx] : levelColor(activeRoute.level)}
+            strokeWidth={7}
+            lineDashPattern={activeRoute.isSafe ? undefined : [10, 6]}
+          />
+        )}
+
+        {/* Marker hazard di sepanjang rute aktif saat navigasi */}
+        {isNavigating && activeRoute?.hazards?.map(node => (
+          <Marker
+            key={`hazard-nav-${node.id}`}
+            coordinate={node.coordinates}
+            anchor={{ x: 0.5, y: 0.5 }}
+            tracksViewChanges={false}
+          >
+            <View style={[
+              styles.hazardNavMarker,
+              { backgroundColor: node.status.risk === 'BAHAYA' ? themeColors.danger : themeColors.warning },
+            ]}>
+              <Icon name="warning" size={12} color="#FFFFFF" />
+            </View>
+          </Marker>
+        ))}
       </MapView>
 
-      {/* Panel Routing Atas */}
-      <View style={[styles.headerWrapper, { paddingTop: insets.top }]} pointerEvents="box-none">
+      {/* Navigation Instruction Card — tampil saat navigasi aktif */}
+      {isNavigating && (
+        <View style={[styles.navInstructionCard, { paddingTop: insets.top + 12 }]}>
+          <View style={styles.navInstructionInner}>
+            <View style={[styles.navIconCircle, { backgroundColor: themeColors.primary }]}>
+              <Icon name={maneuverIcon(activeRoute?.steps?.[navStepIdx]?.maneuver)} size={24} color="#FFFFFF" />
+            </View>
+            <View style={styles.navInstructionText}>
+              <Text style={styles.navInstruction} numberOfLines={2}>
+                {activeRoute?.steps?.[navStepIdx]?.instruction || 'Ikuti rute yang ditampilkan'}
+              </Text>
+              <Text style={styles.navStepDist}>
+                {activeRoute?.steps?.[navStepIdx]?.distance || ''}
+                {activeRoute?.steps?.[navStepIdx + 1]
+                  ? `  ·  Lalu: ${activeRoute.steps[navStepIdx + 1].instruction}`
+                  : ''}
+              </Text>
+            </View>
+          </View>
+        </View>
+      )}
+
+      {/* Panel Routing Atas — sembunyi saat navigasi */}
+      {!isNavigating && <View style={[styles.headerWrapper, { paddingTop: insets.top }]} pointerEvents="box-none">
         <View style={styles.routingCard}>
           <View style={styles.routingHeader}>
             <Text style={styles.routingTitle}>Smart Routing Bencana</Text>
@@ -784,12 +1177,18 @@ const MapScreen = ({ navigation }) => {
               )}
 
               {activeRoute && !isLoadingRoute && (
-                <View style={[styles.routeInfoRow, { borderTopColor: activeRoute.isSafe ? themeColors.border : levelColor(activeRoute.level) + '40' }]}>
-                  <Icon name={activeRoute.isSafe ? 'checkmark-circle' : 'warning'} size={15} color={levelColor(activeRoute.level)} />
-                  <Text style={[styles.routeInfoText, { color: levelColor(activeRoute.level) }]}>
-                    {ROUTE_LABELS[activeRouteIdx]} · {activeRoute.distance} · {activeRoute.duration}
-                  </Text>
-                </View>
+                <>
+                  <View style={[styles.routeInfoRow, { borderTopColor: activeRoute.isSafe ? themeColors.border : levelColor(activeRoute.level) + '40' }]}>
+                    <Icon name={activeRoute.isSafe ? 'checkmark-circle' : 'warning'} size={15} color={levelColor(activeRoute.level)} />
+                    <Text style={[styles.routeInfoText, { color: levelColor(activeRoute.level) }]}>
+                      {ROUTE_LABELS[activeRouteIdx]} · {activeRoute.distance} · {activeRoute.duration}
+                    </Text>
+                  </View>
+                  <TouchableOpacity style={styles.startNavBtn} onPress={startNavigation} activeOpacity={0.8}>
+                    <Icon name="navigate" size={14} color="#FFFFFF" />
+                    <Text style={styles.startNavBtnText}>Mulai Navigasi</Text>
+                  </TouchableOpacity>
+                </>
               )}
               {!activeRoute && !isLoadingRoute && !isLoadingLocation && suggestions.length === 0 && !destination && (
                 <View style={styles.avoidRow}>
@@ -797,23 +1196,98 @@ const MapScreen = ({ navigation }) => {
                   <Text style={styles.avoidText}>Menghindari {dangerCount} titik rawan banjir</Text>
                 </View>
               )}
+
+              {/* Daftar ruas jalan yang otomatis diblokir dari rute karena banjir */}
+              {floodedRoads.length > 0 && (
+                <View style={styles.blockedRoadsBanner}>
+                  <View style={styles.blockedRoadsHeader}>
+                    <Icon name="close-circle" size={13} color={themeColors.danger} />
+                    <Text style={styles.blockedRoadsTitle}>Jalan Diblokir Otomatis</Text>
+                  </View>
+                  {floodedRoads.map(road => (
+                    <View key={road.key} style={styles.blockedRoadRow}>
+                      <View style={[styles.blockedRoadDot, { backgroundColor: themeColors.danger }]} />
+                      <Text style={styles.blockedRoadName} numberOfLines={1}>{road.name}</Text>
+                      <Text style={[styles.blockedRoadCount, { color: themeColors.danger }]}>
+                        {road.nodes.length} sensor
+                      </Text>
+                    </View>
+                  ))}
+                  <Text style={[styles.blockedRoadsNote, { color: themeColors.textMuted }]}>
+                    Rute akan menghindari jalan-jalan di atas secara otomatis.
+                  </Text>
+                </View>
+              )}
             </View>
           )}
         </View>
-      </View>
+      </View>}
 
-      {/* Floating Warning Card */}
-      {showWarningCard && allRoutes.length > 0 && !allRoutes[0].isSafe && (
-        <View style={styles.warningCard}>
+      {/* Navigation Bottom Bar — tampil saat navigasi aktif */}
+      {isNavigating && (
+        <View style={[styles.navBottomBar, { paddingBottom: insets.bottom + 12 }]}>
+          <View style={styles.navBottomLeft}>
+            <Text style={styles.navRemDist}>{navRemaining?.distance || activeRoute?.distance}</Text>
+            <Text style={styles.navRemTime}>{activeRoute?.duration}</Text>
+            {destination?.name ? (
+              <Text style={styles.navDestName} numberOfLines={1}>
+                <Icon name="location" size={11} color={themeColors.textMuted} /> {destination.name}
+              </Text>
+            ) : null}
+          </View>
+          <TouchableOpacity style={styles.navStopBtn} onPress={stopNavigation} activeOpacity={0.8}>
+            <Icon name="stop-circle" size={20} color="#FFFFFF" />
+            <Text style={styles.navStopText}>Berhenti</Text>
+          </TouchableOpacity>
+        </View>
+      )}
+
+      {/* Tombol Recenter — muncul saat user menggeser peta manual saat navigasi */}
+      {isNavigating && !isCameraFollowing && (
+        <TouchableOpacity
+          style={[styles.recenterBtn, { bottom: insets.bottom + 110 }]}
+          onPress={() => {
+            isCameraFollowingRef.current = true;
+            setIsCameraFollowing(true);
+            const loc = userLocationRef.current;
+            if (loc) {
+              mapRef.current?.animateCamera({
+                center: { latitude: loc.latitude, longitude: loc.longitude },
+                pitch: 55,
+                heading: navHeadingRef.current,
+                zoom: 17,
+                altitude: 300,
+              }, { duration: 600 });
+            }
+          }}
+          activeOpacity={0.85}
+        >
+          <Icon name="navigate" size={18} color={themeColors.primary} />
+        </TouchableOpacity>
+      )}
+
+      {/* Floating Route Card — tampil saat rute tersedia dan tidak sedang navigasi */}
+      {showWarningCard && allRoutes.length > 0 && !isNavigating && (
+        <View style={[styles.warningCard, allRoutes[0].isSafe && { borderColor: themeColors.border }]}>
           <ScrollView showsVerticalScrollIndicator={false} bounces={false}>
             <View style={styles.warningCardHeader}>
               <View style={styles.warningTitleRow}>
-                <View style={styles.warningIconBg}>
-                  <Icon name="warning" size={16} color={themeColors.warning} />
+                <View style={[styles.warningIconBg, allRoutes[0].isSafe && { backgroundColor: themeColors.safe + '15' }]}>
+                  <Icon
+                    name={allRoutes[0].isSafe ? 'checkmark-circle' : 'warning'}
+                    size={16}
+                    color={allRoutes[0].isSafe ? themeColors.safe : themeColors.warning}
+                  />
                 </View>
                 <View>
-                  <Text style={styles.warningTitle}>Peringatan Rute</Text>
-                  <Text style={styles.warningSubtitle}>Rute utama melewati titik siaga / waspada</Text>
+                  <Text style={styles.warningTitle}>
+                    {allRoutes[0].isSafe ? 'Pilihan Rute' : 'Peringatan Rute'}
+                  </Text>
+                  <Text style={styles.warningSubtitle}>
+                    {allRoutes[0].isSafe
+                      ? `${allRoutes.length} rute aman ditemukan`
+                      : 'Rute utama melewati titik siaga / waspada'}
+                  </Text>
                 </View>
               </View>
               <TouchableOpacity onPress={() => setShowWarningCard(false)} style={styles.warningCloseBtn}>
@@ -821,19 +1295,32 @@ const MapScreen = ({ navigation }) => {
               </TouchableOpacity>
             </View>
 
-            <View style={styles.warningDivider} />
-            {allRoutes[0].hazards.map(node => (
-              <View key={node.id} style={styles.warningNodeRow}>
-                <View style={[styles.warningDot, { backgroundColor: node.status.color }]} />
-                <Text style={styles.warningNodeName}>{node.name}</Text>
-                <Text style={[styles.warningNodeLevel, { color: node.status.color }]}>
-                  {node.isBinary ? (node.status.flood ? 'Banjir' : 'Kering') : `${node.status.level_cm} cm`}
+            {!allRoutes[0].isSafe && (
+              <>
+                <View style={styles.warningDivider} />
+                {allRoutes[0].hazards.map(node => (
+                  <View key={node.id} style={styles.warningNodeRow}>
+                    <View style={[styles.warningDot, { backgroundColor: node.status.color }]} />
+                    <Text style={styles.warningNodeName}>{node.name}</Text>
+                    <Text style={[styles.warningNodeLevel, { color: node.status.color }]}>
+                      {node.isBinary ? (node.status.flood ? 'Banjir' : 'Kering') : `${node.status.level_cm} cm`}
+                    </Text>
+                  </View>
+                ))}
+              </>
+            )}
+
+            {allRoutesDangerous && (
+              <View style={[styles.dangerBanner, { backgroundColor: themeColors.danger + '15', borderColor: themeColors.danger + '40' }]}>
+                <Icon name="alert-circle" size={14} color={themeColors.danger} />
+                <Text style={[styles.dangerBannerText, { color: themeColors.danger }]}>
+                  Semua rute melewati titik BAHAYA. Hindari perjalanan jika memungkinkan.
                 </Text>
               </View>
-            ))}
+            )}
 
             <View style={styles.warningDivider} />
-            <Text style={styles.altSectionTitle}>3 Pilihan Rute</Text>
+            <Text style={styles.altSectionTitle}>{allRoutes.length} Pilihan Rute</Text>
 
             {allRoutes.map((route, idx) => {
               const isActive = idx === activeRouteIdx;
@@ -877,6 +1364,52 @@ const MapScreen = ({ navigation }) => {
               );
             })}
           </ScrollView>
+        </View>
+      )}
+
+      {/* Proximity Alert Card — muncul ketika user berada <100 m dari sensor bahaya */}
+      {nearbyHazards.length > 0 && !isNavigating && !selectedNode && !showWarningCard && (
+        <View style={[styles.proximityCard, { bottom: insets.bottom + 24 }]}>
+          <View style={styles.proximityHeader}>
+            <View style={[styles.proximityIconBg, { backgroundColor: themeColors.danger + '20' }]}>
+              <Icon name="alert-circle" size={16} color={themeColors.danger} />
+            </View>
+            <View style={styles.proximityTextArea}>
+              <Text style={[styles.proximityTitle, { color: themeColors.textMain }]}>
+                Titik Rawan Terdekat
+              </Text>
+              <Text style={[styles.proximitySubtitle, { color: themeColors.textMuted }]}>
+                {nearbyHazards.length} sensor dalam radius 100 m
+              </Text>
+            </View>
+            <TouchableOpacity
+              onPress={() => setNearbyHazards([])}
+              style={[styles.proximityClose, { backgroundColor: themeColors.border }]}
+            >
+              <Icon name="close" size={13} color={themeColors.textMuted} />
+            </TouchableOpacity>
+          </View>
+
+          {nearbyHazards.slice(0, 3).map(node => (
+            <View key={node.id} style={[styles.proximityNodeRow, { borderTopColor: themeColors.border }]}>
+              <View style={[styles.proximityDot, { backgroundColor: node.status.color }]} />
+              <Text style={[styles.proximityNodeName, { color: themeColors.textMain }]} numberOfLines={1}>
+                {node.name}
+              </Text>
+              <View style={[styles.proximityBadge, { backgroundColor: node.status.color + '20' }]}>
+                <Text style={[styles.proximityBadgeText, { color: node.status.color }]}>
+                  {node.status.risk}
+                </Text>
+              </View>
+            </View>
+          ))}
+
+          <View style={[styles.proximityFooter, { borderTopColor: themeColors.border }]}>
+            <Icon name="warning-outline" size={11} color={themeColors.warning} />
+            <Text style={[styles.proximityFooterText, { color: themeColors.textMuted }]}>
+              Hindari jalan di sekitar lokasi ini
+            </Text>
+          </View>
         </View>
       )}
 
@@ -1050,6 +1583,64 @@ const getStyles = (COLORS, isDarkMode) => StyleSheet.create({
   avoidText: { fontSize: 11, fontWeight: '700', color: COLORS.warning },
   routeInfoRow: { flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 10, paddingTop: 10, borderTopWidth: 1 },
   routeInfoText: { fontSize: 13, fontWeight: '700' },
+  // Panah navigasi yang bergerak di peta
+  navArrowOuter: {
+    width: 52, height: 52,
+    justifyContent: 'center', alignItems: 'center',
+    borderRadius: 26,
+    backgroundColor: COLORS.primary + '30',
+  },
+  navArrowCircle: {
+    width: 38, height: 38, borderRadius: 19,
+    backgroundColor: COLORS.primary,
+    justifyContent: 'center', alignItems: 'center',
+    shadowColor: '#000', shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.3, shadowRadius: 4, elevation: 6,
+    borderWidth: 2, borderColor: '#FFFFFF',
+  },
+
+  startNavBtn: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
+    gap: 6, marginTop: 8, paddingVertical: 11, borderRadius: 12,
+    backgroundColor: COLORS.primary,
+  },
+  startNavBtnText: { fontSize: 13, fontWeight: '700', color: '#FFFFFF' },
+
+  // Navigation instruction card (atas peta)
+  navInstructionCard: {
+    position: 'absolute', top: 0, left: 0, right: 0, zIndex: 20,
+    backgroundColor: COLORS.cardBg,
+    paddingHorizontal: 20, paddingBottom: 16,
+    shadowColor: COLORS.shadow, shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.15, shadowRadius: 12, elevation: 10,
+  },
+  navInstructionInner: { flexDirection: 'row', alignItems: 'center', gap: 14 },
+  navIconCircle: {
+    width: 52, height: 52, borderRadius: 26,
+    justifyContent: 'center', alignItems: 'center', flexShrink: 0,
+  },
+  navInstructionText: { flex: 1 },
+  navInstruction: { fontSize: 16, fontWeight: '800', color: COLORS.textMain, lineHeight: 22 },
+  navStepDist: { fontSize: 12, fontWeight: '600', color: COLORS.textMuted, marginTop: 3 },
+
+  // Navigation bottom bar
+  navBottomBar: {
+    position: 'absolute', bottom: 0, left: 0, right: 0, zIndex: 20,
+    backgroundColor: COLORS.cardBg,
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    paddingHorizontal: 24, paddingTop: 16,
+    shadowColor: COLORS.shadow, shadowOffset: { width: 0, height: -4 },
+    shadowOpacity: 0.1, shadowRadius: 12, elevation: 10,
+  },
+  navBottomLeft: { flex: 1, marginRight: 16 },
+  navRemDist: { fontSize: 28, fontWeight: '900', color: COLORS.textMain, letterSpacing: -1 },
+  navRemTime: { fontSize: 14, fontWeight: '600', color: COLORS.textMuted },
+  navDestName: { fontSize: 12, fontWeight: '600', color: COLORS.textMuted, marginTop: 2 },
+  navStopBtn: {
+    flexDirection: 'row', alignItems: 'center', gap: 6,
+    backgroundColor: COLORS.danger, paddingHorizontal: 18, paddingVertical: 12, borderRadius: 16,
+  },
+  navStopText: { fontSize: 14, fontWeight: '700', color: '#FFFFFF' },
 
   // Warning Card
   warningCard: {
@@ -1074,6 +1665,11 @@ const getStyles = (COLORS, isDarkMode) => StyleSheet.create({
     backgroundColor: COLORS.border, justifyContent: 'center', alignItems: 'center', marginLeft: 8,
   },
   warningDivider: { height: 1, backgroundColor: COLORS.border, marginVertical: 8 },
+  dangerBanner: {
+    flexDirection: 'row', alignItems: 'center', gap: 6,
+    padding: 8, borderRadius: 8, borderWidth: 1, marginTop: 4,
+  },
+  dangerBannerText: { flex: 1, fontSize: 11, fontWeight: '700', lineHeight: 15 },
   warningNodeRow: {
     flexDirection: 'row', alignItems: 'center',
     paddingVertical: 4, paddingHorizontal: 8,
@@ -1104,6 +1700,70 @@ const getStyles = (COLORS, isDarkMode) => StyleSheet.create({
   altRouteDetail: { fontSize: 11, fontWeight: '600', color: COLORS.textMuted },
   altRouteDanger: { fontSize: 10, color: COLORS.warning, fontWeight: '600', marginTop: 1 },
   altActiveIndicator: { width: 4, borderRadius: 0 },
+
+  // Tombol recenter kamera navigasi
+  recenterBtn: {
+    position: 'absolute', right: 20, zIndex: 25,
+    width: 44, height: 44, borderRadius: 22,
+    backgroundColor: '#FFFFFF',
+    justifyContent: 'center', alignItems: 'center',
+    shadowColor: '#000', shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.18, shadowRadius: 8, elevation: 8,
+    borderWidth: 1.5, borderColor: COLORS.primary + '30',
+  },
+
+  // Marker hazard di rute saat navigasi aktif
+  hazardNavMarker: {
+    width: 26, height: 26, borderRadius: 13,
+    justifyContent: 'center', alignItems: 'center',
+    borderWidth: 2, borderColor: '#FFFFFF',
+  },
+
+  // Blocked roads banner (di dalam routing panel)
+  blockedRoadsBanner: {
+    marginTop: 10, padding: 10, borderRadius: 12,
+    backgroundColor: COLORS.danger + '0D',
+    borderWidth: 1, borderColor: COLORS.danger + '30',
+  },
+  blockedRoadsHeader: { flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 8 },
+  blockedRoadsTitle: { fontSize: 11, fontWeight: '800', color: COLORS.danger, textTransform: 'uppercase', letterSpacing: 0.5 },
+  blockedRoadRow: {
+    flexDirection: 'row', alignItems: 'center',
+    paddingVertical: 4, paddingHorizontal: 6,
+    backgroundColor: COLORS.danger + '08', borderRadius: 8, marginBottom: 4,
+  },
+  blockedRoadDot: { width: 6, height: 6, borderRadius: 3, marginRight: 8 },
+  blockedRoadName: { flex: 1, fontSize: 12, fontWeight: '700', color: COLORS.textMain },
+  blockedRoadCount: { fontSize: 10, fontWeight: '700' },
+  blockedRoadsNote: { fontSize: 10, fontWeight: '500', marginTop: 4, fontStyle: 'italic' },
+
+  // Proximity alert card (floating bottom)
+  proximityCard: {
+    position: 'absolute', left: 20, right: 20, zIndex: 25,
+    backgroundColor: COLORS.cardBg, borderRadius: 18, padding: 14,
+    shadowColor: COLORS.shadow, shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.14, shadowRadius: 16, elevation: 12,
+    borderWidth: 1.5, borderColor: COLORS.danger + '40',
+  },
+  proximityHeader: { flexDirection: 'row', alignItems: 'center', marginBottom: 10 },
+  proximityIconBg: { width: 36, height: 36, borderRadius: 10, justifyContent: 'center', alignItems: 'center', marginRight: 10 },
+  proximityTextArea: { flex: 1 },
+  proximityTitle: { fontSize: 13, fontWeight: '800' },
+  proximitySubtitle: { fontSize: 11, fontWeight: '500', marginTop: 1 },
+  proximityClose: { width: 24, height: 24, borderRadius: 12, justifyContent: 'center', alignItems: 'center', marginLeft: 8 },
+  proximityNodeRow: {
+    flexDirection: 'row', alignItems: 'center',
+    paddingVertical: 7, borderTopWidth: StyleSheet.hairlineWidth,
+  },
+  proximityDot: { width: 8, height: 8, borderRadius: 4, marginRight: 10 },
+  proximityNodeName: { flex: 1, fontSize: 13, fontWeight: '700' },
+  proximityBadge: { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 8 },
+  proximityBadgeText: { fontSize: 10, fontWeight: '800', textTransform: 'uppercase' },
+  proximityFooter: {
+    flexDirection: 'row', alignItems: 'center', gap: 5,
+    paddingTop: 8, marginTop: 4, borderTopWidth: StyleSheet.hairlineWidth,
+  },
+  proximityFooterText: { fontSize: 11, fontWeight: '600' },
 
   // Bottom Sheet
   bottomSheet: {
